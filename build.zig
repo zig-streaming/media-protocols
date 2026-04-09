@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "core", .module = media.module("core") },
+            .{ .name = "media", .module = media.module("media") },
         },
     });
 
@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const mod = b.addModule("protocols", .{
+    _ = b.addModule("protocols", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{
@@ -70,32 +70,6 @@ pub fn build(b: *std.Build) void {
                 single_step.dependOn(&run.step);
                 bench_step.dependOn(&run.step);
             }
-        }
-    }
-
-    {
-        const exe = b.addExecutable(.{
-            .name = "protocols",
-            .root_module = b.createModule(.{
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "protocols", .module = mod },
-                },
-            }),
-        });
-
-        b.installArtifact(exe);
-
-        const run_step = b.step("run", "Run the app");
-
-        const run_cmd = b.addRunArtifact(exe);
-        run_step.dependOn(&run_cmd.step);
-
-        run_cmd.step.dependOn(b.getInstallStep());
-
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
         }
     }
 }

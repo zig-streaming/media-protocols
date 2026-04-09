@@ -3,7 +3,7 @@ const std = @import("std");
 const Self = @This();
 const Writer = std.Io.Writer;
 
-const annexb_start_code = @import("core").h264.annexb_start_code;
+const annexb_start_code = @import("media").h264.annexb_start_code;
 const fu_header_size: usize = 2;
 const stapa_length_size: usize = 2;
 
