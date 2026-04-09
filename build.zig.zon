@@ -5,7 +5,8 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .media = .{
-            .path = "../media",
+            .url = "git+https://github.com/zig-streaming/media.git#91ce9274ac51314615efd10cc0895b1a19daec7a",
+            .hash = "media-0.0.0-qc-dCGKkAAAjalYes1ZH9sarECSnn6S8yTNFunPx2uBd",
         },
     },
     .paths = .{
