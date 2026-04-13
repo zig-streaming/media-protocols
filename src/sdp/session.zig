@@ -400,8 +400,8 @@ test "parse minimal SDP" {
     try std.testing.expectEqualStrings(origin.username, "jdoe");
     try std.testing.expect(origin.session_id == 3724394400);
     try std.testing.expectEqualStrings(origin.session_version, "3724394405");
-    try std.testing.expect(origin.nettype == Connection.NetType.IN);
-    try std.testing.expect(origin.addrtype == Connection.AddrType.IP4);
+    try std.testing.expect(origin.nettype == Connection.NetType.in);
+    try std.testing.expect(origin.addrtype == Connection.AddrType.ip4);
     try std.testing.expectEqualStrings(origin.unicast_address, "198.51.100.1");
 
     try std.testing.expectEqualStrings(sdp.session_name, "Call to John Smith");
@@ -414,8 +414,8 @@ test "parse minimal SDP" {
 
     try std.testing.expect(sdp.connection != null);
     const conn = sdp.connection.?;
-    try std.testing.expect(conn.net_type == Connection.NetType.IN);
-    try std.testing.expect(conn.addr_type == Connection.AddrType.IP4);
+    try std.testing.expect(conn.net_type == Connection.NetType.in);
+    try std.testing.expect(conn.addr_type == Connection.AddrType.ip4);
     try std.testing.expectEqualStrings("198.51.100.1", conn.address);
 
     // Session Attributes

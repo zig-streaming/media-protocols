@@ -2,8 +2,8 @@ const std = @import("std");
 
 const Self = @This();
 
-pub const NetType = enum { IN };
-pub const AddrType = enum { IP4, IP6 };
+pub const NetType = enum { in };
+pub const AddrType = enum { ip4, ip6 };
 
 net_type: NetType,
 addr_type: AddrType,
@@ -29,7 +29,7 @@ pub fn parse(buffer: []const u8) !Self {
 
 pub fn parseNetType(input: []const u8) !NetType {
     if (std.mem.eql(u8, "IN", input)) {
-        return NetType.IN;
+        return .in;
     } else {
         return error.InvalidNetType;
     }
@@ -37,9 +37,9 @@ pub fn parseNetType(input: []const u8) !NetType {
 
 pub fn parseAddrType(input: []const u8) !AddrType {
     if (std.mem.eql(u8, "IP4", input)) {
-        return AddrType.IP4;
+        return .ip4;
     } else if (std.mem.eql(u8, "IP6", input)) {
-        return AddrType.IP6;
+        return .ip6;
     } else {
         return error.InvalidAddrType;
     }
@@ -47,7 +47,7 @@ pub fn parseAddrType(input: []const u8) !AddrType {
 
 test "parseNetType: valid IN" {
     const result = try parseNetType("IN");
-    try std.testing.expectEqual(NetType.IN, result);
+    try std.testing.expectEqual(NetType.in, result);
 }
 
 test "parseNetType: invalid returns error" {
@@ -58,12 +58,12 @@ test "parseNetType: invalid returns error" {
 
 test "parseAddrType: valid IP4" {
     const result = try parseAddrType("IP4");
-    try std.testing.expectEqual(AddrType.IP4, result);
+    try std.testing.expectEqual(AddrType.ip4, result);
 }
 
 test "parseAddrType: valid IP6" {
     const result = try parseAddrType("IP6");
-    try std.testing.expectEqual(AddrType.IP6, result);
+    try std.testing.expectEqual(AddrType.ip6, result);
 }
 
 test "parseAddrType: invalid returns error" {
@@ -74,15 +74,15 @@ test "parseAddrType: invalid returns error" {
 
 test "parse: IPv4 connection" {
     const result = try parse("IN IP4 192.168.1.1");
-    try std.testing.expectEqual(NetType.IN, result.net_type);
-    try std.testing.expectEqual(AddrType.IP4, result.addr_type);
+    try std.testing.expectEqual(NetType.in, result.net_type);
+    try std.testing.expectEqual(AddrType.ip4, result.addr_type);
     try std.testing.expectEqualStrings("192.168.1.1", result.address);
 }
 
 test "parse: IPv6 connection" {
     const result = try parse("IN IP6 ::1");
-    try std.testing.expectEqual(NetType.IN, result.net_type);
-    try std.testing.expectEqual(AddrType.IP6, result.addr_type);
+    try std.testing.expectEqual(NetType.in, result.net_type);
+    try std.testing.expectEqual(AddrType.ip6, result.addr_type);
     try std.testing.expectEqualStrings("::1", result.address);
 }
 
