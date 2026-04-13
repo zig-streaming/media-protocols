@@ -1,5 +1,5 @@
 const std = @import("std");
-const core = @import("core");
+const media = @import("media");
 const Packet = @import("packet.zig");
 
 const Depacketizer = @This();
@@ -40,7 +40,7 @@ pub fn deinit(self: *Depacketizer) void {
     self.allocator.free(self.buffer);
 }
 
-pub fn depacketize(self: *Depacketizer, rtp: Packet) !?core.Packet {
+pub fn depacketize(self: *Depacketizer, rtp: Packet) !?media.Packet {
     while (true) {
         const written = self.vtable.depacketize(self.impl, rtp.payload, self.buffer[self.offset..]) catch |err| switch (err) {
             error.ShortBuffer => {
@@ -53,7 +53,7 @@ pub fn depacketize(self: *Depacketizer, rtp: Packet) !?core.Packet {
         if (written) |size| self.offset += size;
 
         if (rtp.header.marker) {
-            const media_packet: core.Packet = .{
+            const media_packet: media.Packet = .{
                 .data = self.buffer[0..self.offset],
                 .dts = rtp.header.timestamp,
                 .pts = rtp.header.timestamp,
