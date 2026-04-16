@@ -3,7 +3,7 @@ const std = @import("std");
 const Reader = std.Io.Reader;
 const Self = @This();
 
-const Error = error{EndOfStream};
+pub const Error = error{EndOfStream};
 
 /// RTP Packet Structure
 pub const Header = struct {
