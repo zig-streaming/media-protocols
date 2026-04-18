@@ -41,23 +41,20 @@ pub const RtpMap = struct {
     params: ?[]const u8,
 
     pub fn parse(value: []const u8) !RtpMap {
-        const idx = std.mem.indexOfScalar(u8, value, ' ') orelse return error.InvalidRtpMap;
-        const payload_type = std.fmt.parseInt(u8, value[0..idx], 10) catch return error.InvalidRtpMap;
+        const space = std.mem.indexOfScalar(u8, value, ' ') orelse return error.InvalidRtpMap;
+        const payload_type = std.fmt.parseInt(u8, value[0..space], 10) catch return error.InvalidRtpMap;
 
-        var iterator = std.mem.splitScalar(u8, std.mem.trim(u8, value[idx + 1 ..], " \t"), '/');
-        var part: []const u8 = undefined;
+        const rest = std.mem.trim(u8, value[space + 1 ..], " \t");
+        var it = std.mem.splitScalar(u8, rest, '/');
 
-        const encoding = iterator.next() orelse return error.InvalidRtpMap;
+        const encoding = it.next() orelse return error.InvalidRtpMap;
+        const clock_rate = std.fmt.parseInt(u32, it.next() orelse return error.InvalidRtpMap, 10) catch return error.InvalidRtpMap;
 
-        part = iterator.next() orelse return error.InvalidRtpMap;
-        const clock_rate = std.fmt.parseInt(u32, part, 10) catch return error.InvalidRtpMap;
-        const params = iterator.next();
-
-        return RtpMap{
+        return .{
             .payload_type = payload_type,
             .encoding = encoding,
             .clock_rate = clock_rate,
-            .params = params,
+            .params = it.next(),
         };
     }
 };
@@ -67,7 +64,7 @@ pub const Fmtp = struct {
     payload_type: u8,
     packetization_mode: ?u8 = null,
     profile_level_id: ?[]const u8 = null,
-    sprop_parameter_sets: ?[]const u8 = null,
+    sprop_parameter_sets: ?struct { sps: []const u8, pps: []const u8 } = null,
 
     pub fn parse(data: []const u8) !Fmtp {
         if (std.mem.indexOfScalar(u8, data, ' ')) |idx| {
@@ -87,7 +84,14 @@ pub const Fmtp = struct {
                     if (std.mem.eql(u8, key, "profile-level-id")) {
                         result.profile_level_id = value;
                     } else if (std.mem.eql(u8, key, "sprop-parameter-sets")) {
-                        result.sprop_parameter_sets = value;
+                        if (std.mem.indexOfScalar(u8, value, ',')) |idx2| {
+                            result.sprop_parameter_sets = .{
+                                .sps = value[0..idx2],
+                                .pps = value[idx2 + 1 ..],
+                            };
+                        } else {
+                            return error.InvalidSpropParameterSets;
+                        }
                     } else if (std.mem.eql(u8, key, "packetization-mode")) {
                         result.packetization_mode = std.fmt.parseInt(u8, value, 10) catch return error.InvalidFmtp;
                     }
