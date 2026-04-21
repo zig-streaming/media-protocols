@@ -1,4 +1,6 @@
 const std = @import("std");
+const h264 = @import("media").h264;
+const FrameInfo = @import("frame_info.zig");
 
 const Self = @This();
 const Writer = std.Io.Writer;
@@ -24,7 +26,7 @@ pub fn init(packet_type: PacketType) Self {
 ///
 /// Returns the number of bytes written in case the whole NAL units is written, null if more packets needed
 /// or an error if the packet is invalid or the buffer is too small.
-pub fn depacketize(self: *Self, payload: []const u8, dest: []u8) !?usize {
+pub fn depacketize(self: *Self, payload: []const u8, dest: []u8) !?FrameInfo {
     switch (payload[0] & 0x1F) {
         // Single NAL Unit Packet
         1...21 => {
@@ -33,13 +35,14 @@ pub fn depacketize(self: *Self, payload: []const u8, dest: []u8) !?usize {
             }
             self.writePrefix(dest, payload.len);
             @memcpy(dest[annexb_start_code.len .. annexb_start_code.len + payload.len], payload);
-            return payload.len + annexb_start_code.len;
+            return .{ .written = payload.len + annexb_start_code.len, .keyframe = h264.NalHeader.fromByte(payload[0]).type == .idr };
         },
         // STAP-A Packet
         24 => {
             @branchHint(.unlikely);
             var slice = payload[1..];
             var offset: usize = 0;
+            var keyframe = false;
 
             while (slice.len > 0) {
                 if (slice.len < stapa_length_size) {
@@ -56,10 +59,11 @@ pub fn depacketize(self: *Self, payload: []const u8, dest: []u8) !?usize {
                 @memcpy(dest[offset .. offset + nal_size], slice[0..nal_size]);
                 offset += nal_size;
 
+                keyframe = keyframe or h264.NalHeader.fromByte(slice[0]).type == .idr;
                 slice = slice[nal_size..];
             }
 
-            return offset;
+            return .{ .written = offset, .keyframe = keyframe };
         },
         // FU-A Packet
         28 => {
@@ -90,7 +94,7 @@ pub fn depacketize(self: *Self, payload: []const u8, dest: []u8) !?usize {
                 const result = self.fu_offset;
                 self.fu_started = false;
                 self.fu_offset = 0;
-                return result;
+                return .{ .written = result, .keyframe = h264.NalHeader.fromByte(dest[annexb_start_code.len]).type == .idr };
             }
 
             return null;
@@ -116,8 +120,21 @@ test "Depacketize Single NAL Unit Packet" {
     const written = try depacketizer.depacketize(&nal_unit, &buffer);
 
     try std.testing.expect(written != null);
-    try std.testing.expectEqual(9, written.?);
-    try std.testing.expectEqualSlices(u8, &expected, buffer[0..written.?]);
+    try std.testing.expectEqual(expected.len, written.?.written);
+    try std.testing.expect(written.?.keyframe); // 0x65 = IDR NAL type 5
+    try std.testing.expectEqualSlices(u8, &expected, buffer[0..written.?.written]);
+}
+
+test "Depacketize Single NAL Unit Packet non-keyframe" {
+    var depacketizer: Self = .init(.annexb);
+
+    const nal_unit: [5]u8 = [_]u8{ 0x41, 0x9A, 0x22, 0x00, 0x00 }; // NAL type 1 = non-IDR
+    var buffer: [1024]u8 = undefined;
+
+    const written = try depacketizer.depacketize(&nal_unit, &buffer);
+
+    try std.testing.expect(written != null);
+    try std.testing.expect(!written.?.keyframe);
 }
 
 test "Depacketize StapA" {
@@ -141,8 +158,27 @@ test "Depacketize StapA" {
     const written = try depacketizer.depacketize(&stap_a_packet, &buffer);
 
     try std.testing.expect(written != null);
-    try std.testing.expectEqual(expected.len, written.?);
-    try std.testing.expectEqualSlices(u8, expected, buffer[0..written.?]);
+    try std.testing.expectEqual(expected.len, written.?.written);
+    try std.testing.expect(written.?.keyframe); // contains IDR NALU (0x65)
+    try std.testing.expectEqualSlices(u8, expected, buffer[0..written.?.written]);
+}
+
+test "Depacketize StapA non-keyframe" {
+    var buffer: [1024]u8 = undefined;
+    var depacketizer: Self = .init(.annexb);
+
+    const stap_a_packet: [9]u8 = [_]u8{
+        24, // STAP-A NAL unit type
+        0x00, 0x03, // NALU 1 size
+        0x41, 0x9A, 0x22, // NALU 1 (non-IDR, type 1)
+        0x00, 0x01, // NALU 2 size
+        0x68, // NALU 2 (PPS, type 8)
+    };
+
+    const written = try depacketizer.depacketize(&stap_a_packet, &buffer);
+
+    try std.testing.expect(written != null);
+    try std.testing.expect(!written.?.keyframe);
 }
 
 test "Invalid StapA packet" {
