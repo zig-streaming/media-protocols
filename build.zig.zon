@@ -2,11 +2,11 @@
     .name = .protocols,
     .version = "0.0.0",
     .fingerprint = 0x64ac020c8f5dd29c,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .media = .{
-            .url = "git+https://github.com/zig-streaming/media.git#bd869a77791562690f4bc2a07c4a45c2fbb6ec93",
-            .hash = "media-0.1.0-qc-dCLLpAAB6ru1JOEwVLyLXrYTFYV5TEz69KzKKzSb_",
+            .url = "git+https://github.com/zig-streaming/media.git?ref=v0.16.0#3687b690509a8218e54e35d6e7b06cdc7895d863",
+            .hash = "media-0.1.0-qc-dCIPmAAD-TSJlOtqMQ0z1-LuI5AIl39h7AM7y7LNn",
         },
     },
     .paths = .{
