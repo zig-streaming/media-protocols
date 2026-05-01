@@ -1,4 +1,5 @@
 const std = @import("std");
+const zbench = @import("zbench");
 const Packet = @import("rtp").Packet;
 
 // Basic RTP packet (no CSRC, no extension, no padding)
@@ -39,60 +40,36 @@ const padding_packet = [_]u8{
     0x05, 0x00, 0x09, 0x00, 0x00, 0x00, 0x04,
 };
 
-const iterations = 1_000_000;
-
-pub fn main() !void {
-    var buffer: [1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buffer);
-
-    try stdout.interface.writeAll("\x1b[1;36m┌──────────────────────────┐\x1b[0m\n");
-    try stdout.interface.writeAll("\x1b[1;36m│   RTP Packet Benchmarks  │\x1b[0m\n");
-    try stdout.interface.writeAll("\x1b[1;36m└──────────────────────────┘\x1b[0m\n\n");
-
-    // Warm-up: one pass to bring code/data into cache.
-    for (0..iterations) |_| {
-        const packet = try Packet.parse(&basic_packet);
-        std.mem.doNotOptimizeAway(packet);
-    }
-
-    const fixtures = [_]struct {
-        name: []const u8,
-        data: []const u8,
-    }{
-        .{ .name = "Basic", .data = &basic_packet },
-        .{ .name = "With CSRC", .data = &csrc_packet },
-        .{ .name = "With Extension", .data = &extension_packet },
-        .{ .name = "With Padding", .data = &padding_packet },
-    };
-
-    for (fixtures) |fixture| {
-        try benchMark(fixture.name, fixture.data, &stdout.interface);
-    }
-
-    try stdout.interface.flush();
+fn parseBasic(_: std.mem.Allocator) void {
+    const packet = Packet.parse(&basic_packet) catch unreachable;
+    std.mem.doNotOptimizeAway(packet);
 }
 
-fn benchMark(name: []const u8, data: []const u8, writer: *std.Io.Writer) !void {
-    var timer = try std.time.Timer.start();
+fn parseCsrc(_: std.mem.Allocator) void {
+    const packet = Packet.parse(&csrc_packet) catch unreachable;
+    std.mem.doNotOptimizeAway(packet);
+}
 
-    for (0..iterations) |_| {
-        const packet = try Packet.parse(data);
-        std.mem.doNotOptimizeAway(packet);
-    }
+fn parseWithExtension(_: std.mem.Allocator) void {
+    const packet = Packet.parse(&extension_packet) catch unreachable;
+    std.mem.doNotOptimizeAway(packet);
+}
 
-    const elapsed_ns = timer.read();
-    const ns_per_op = elapsed_ns / iterations;
-    const ops_per_sec = @as(u64, std.time.ns_per_s) / @max(ns_per_op, 1);
+fn parseWithPadding(_: std.mem.Allocator) void {
+    const packet = Packet.parse(&padding_packet) catch unreachable;
+    std.mem.doNotOptimizeAway(packet);
+}
 
-    try writer.print("\x1b[1;33mRTP Packet {s}\x1b[0m\n" ++
-        "  iterations : {d}\n" ++
-        "  total time : {d} ms\n" ++
-        "  ns/op      : {d}\n" ++
-        "  ops/sec    : {d}\n\n", .{
-        name,
-        iterations,
-        elapsed_ns / std.time.ns_per_ms,
-        ns_per_op,
-        ops_per_sec,
-    });
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const stdout: std.Io.File = .stdout();
+
+    var bench = zbench.Benchmark.init(init.gpa, .{});
+    defer bench.deinit();
+
+    try bench.add("RTP: basic", parseBasic, .{});
+    try bench.add("RTP: packet with csrc", parseCsrc, .{});
+    try bench.add("RTP: packet with extension", parseWithExtension, .{});
+    try bench.add("RTP: packet with padding", parseWithPadding, .{});
+    try bench.run(io, stdout);
 }

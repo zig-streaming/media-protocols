@@ -1,4 +1,5 @@
 const std = @import("std");
+const zbench = @import("zbench");
 const Session = @import("sdp").Session;
 
 // Minimal SDP session (no media)
@@ -31,70 +32,41 @@ const full_sdp =
     \\
 ;
 
-const iterations = 1_000_000;
-
-pub fn main() !void {
-    var buffer: [1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buffer);
-
-    try stdout.interface.writeAll("\x1b[1;36m┌──────────────────────────────┐\x1b[0m\n");
-    try stdout.interface.writeAll("\x1b[1;36m│  SDP Session Parse Benchmarks│\x1b[0m\n");
-    try stdout.interface.writeAll("\x1b[1;36m└──────────────────────────────┘\x1b[0m\n\n");
-
-    // Warm-up: one pass to bring code/data into cache.
-    for (0..iterations) |_| {
-        const session = try Session.parse(minimal_sdp);
-        std.mem.doNotOptimizeAway(session);
-    }
-
-    const fixtures = [_]struct {
-        name: []const u8,
-        data: []const u8,
-    }{
-        .{ .name = "Minimal (no media)", .data = minimal_sdp },
-        .{ .name = "Full (3 media)", .data = full_sdp },
-    };
-
-    for (fixtures) |fixture| {
-        try benchMark(fixture.name, fixture.data, &stdout.interface);
-    }
-
-    try stdout.interface.flush();
+fn parseMinimal(allocator: std.mem.Allocator) void {
+    _ = allocator;
+    parseSDP(minimal_sdp) catch unreachable;
 }
 
-fn benchMark(name: []const u8, data: []const u8, writer: *std.Io.Writer) !void {
-    var timer = try std.time.Timer.start();
+fn parseFull(allocator: std.mem.Allocator) void {
+    _ = allocator;
+    parseSDP(full_sdp) catch unreachable;
+}
 
-    for (0..iterations) |_| {
-        const session = try Session.parse(data);
+fn parseSDP(data: []const u8) !void {
+    const session = try Session.parse(data);
 
-        var attr_iter = session.attributeIterator();
-        while (try attr_iter.next()) |attr| {
-            std.mem.doNotOptimizeAway(attr);
-        }
-
-        var media_iter = session.mediaIterator();
-        while (try media_iter.next()) |media| {
-            var media_attr_iter = media.attributeIterator();
-            while (try media_attr_iter.next()) |attr| {
-                std.mem.doNotOptimizeAway(attr);
-            }
-        }
+    var attr_iter = session.attributeIterator();
+    while (try attr_iter.next()) |attr| {
+        std.mem.doNotOptimizeAway(attr);
     }
 
-    const elapsed_ns = timer.read();
-    const ns_per_op = elapsed_ns / iterations;
-    const ops_per_sec = @as(u64, std.time.ns_per_s) / @max(ns_per_op, 1);
+    var media_iter = session.mediaIterator();
+    while (try media_iter.next()) |media| {
+        var media_attr_iter = media.attributeIterator();
+        while (try media_attr_iter.next()) |attr| {
+            std.mem.doNotOptimizeAway(attr);
+        }
+    }
+}
 
-    try writer.print("\x1b[1;33mSDP Session {s}\x1b[0m\n" ++
-        "  iterations : {d}\n" ++
-        "  total time : {d} ms\n" ++
-        "  ns/op      : {d}\n" ++
-        "  ops/sec    : {d}\n\n", .{
-        name,
-        iterations,
-        elapsed_ns / std.time.ns_per_ms,
-        ns_per_op,
-        ops_per_sec,
-    });
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const stdout: std.Io.File = .stdout();
+
+    var bench = zbench.Benchmark.init(init.gpa, .{});
+    defer bench.deinit();
+
+    try bench.add("Parse Minimal SDP", parseMinimal, .{});
+    try bench.add("Parse Full SDP", parseFull, .{});
+    try bench.run(io, stdout);
 }
