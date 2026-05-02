@@ -1,3 +1,4 @@
+//! Describes an RTP packet.
 const std = @import("std");
 
 const Reader = std.Io.Reader;
@@ -5,78 +6,67 @@ const Self = @This();
 
 pub const Error = error{EndOfStream};
 
-/// RTP Packet Structure
-pub const Header = struct {
-    version: u2,
-    padding: bool,
-    extension: bool,
-    csrc_count: u4,
-    marker: bool,
-    payload_type: u7,
-    sequence_number: u16,
-    timestamp: u32,
+/// Describes an RTP header.
+pub const Header = packed struct {
     ssrc: u32,
-    csrc_list: []align(1) const u32,
-    extension_profile: ?u16 = null,
-    extensions: ?[]const u8 = null,
-    padding_size: u8 = 0,
-    size: usize,
+    timestamp: u32,
+    sequence_number: u16,
+    payload_type: u7,
+    marker: bool,
+    csrc_count: u4 = 0,
+    extension: bool,
+    padding: bool,
+    version: u2 = 2,
+};
 
-    /// Parse RTP Header from byte slice
-    pub fn parse(data: []const u8) Reader.Error!Header {
-        var reader = Reader.fixed(data);
-        const bytes = try reader.take(2);
+/// Describes an RTP Extension
+pub const Extension = struct {
+    profile: u16,
+    data: []const u8,
 
-        var header: Header = .{
-            .version = @intCast(bytes[0] >> 6),
-            .padding = bytes[0] & 0x20 != 0,
-            .marker = bytes[1] & 0x80 != 0,
-            .payload_type = @intCast(bytes[1] & 0x7F),
-            .extension = bytes[0] & 0x10 != 0,
-            .sequence_number = try reader.takeInt(u16, .big),
-            .timestamp = try reader.takeInt(u32, .big),
-            .ssrc = try reader.takeInt(u32, .big),
-            .csrc_count = @intCast(bytes[0] & 0x0F),
-            .csrc_list = undefined,
-            .size = 0,
+    fn parse(reader: *Reader) !Extension {
+        const profile = reader.takeInt(u16, .big) catch return error.EndOfStream;
+        const extension_size = (reader.takeInt(u16, .big) catch return error.EndOfStream) * 4;
+        const ext_data = reader.take(extension_size) catch return error.EndOfStream;
+
+        return .{
+            .profile = profile,
+            .data = ext_data,
         };
-
-        header.csrc_list = std.mem.bytesAsSlice(u32, try reader.take(@as(usize, header.csrc_count) * 4));
-
-        if (header.extension) {
-            header.extension_profile = try reader.takeInt(u16, .big);
-            const extension_size = try reader.takeInt(u16, .big) * 4;
-            header.extensions = try reader.take(extension_size);
-        }
-
-        header.size = reader.seek;
-        return header;
     }
 };
 
 header: Header,
+csrc_list: []align(1) const u32 = &.{},
+extension: ?Extension = null,
 payload: []const u8,
+padding_size: u8 = 0,
 
 /// Parses RTP Packet from slice
 pub fn parse(data: []const u8) Error!Self {
-    var header = Header.parse(data) catch |err| switch (err) {
-        error.EndOfStream => return error.EndOfStream,
-        else => unreachable,
+    var reader = std.Io.Reader.fixed(data);
+    var packet: Self = .{
+        .header = undefined,
+        .payload = &.{},
     };
 
-    if (header.padding) {
-        if (header.size >= data.len or data[data.len - 1] + header.size > data.len) {
+    packet.header = reader.takeStruct(Header, .big) catch return error.EndOfStream;
+    const csrc_count = reader.take(@as(usize, packet.header.csrc_count) * 4) catch return error.EndOfStream;
+    packet.csrc_list = std.mem.bytesAsSlice(u32, csrc_count);
+
+    if (packet.header.extension) packet.extension = try .parse(&reader);
+
+    if (packet.header.padding) {
+        if (reader.seek >= data.len or data[data.len - 1] + reader.seek > data.len) {
             @branchHint(.unlikely);
             return error.EndOfStream;
         }
 
-        header.padding_size = data[data.len - 1];
+        packet.padding_size = data[data.len - 1];
     }
+    packet.payload = data[reader.seek .. reader.end - packet.padding_size];
 
-    return .{
-        .header = header,
-        .payload = data[header.size .. data.len - header.padding_size],
-    };
+    return packet;
 }
 
 pub fn format(self: Self, writer: *std.Io.Writer) !void {
@@ -140,7 +130,7 @@ test "packet with csrc" {
     const parsed_packet = try Self.parse(packet[0..]);
     try std.testing.expect(parsed_packet.header.csrc_count == 3);
 
-    for (csrc_list, parsed_packet.header.csrc_list) |csrc, parsed_csrc| {
+    for (csrc_list, parsed_packet.csrc_list) |csrc, parsed_csrc| {
         try std.testing.expect(csrc == parsed_csrc);
     }
 }
@@ -157,8 +147,8 @@ test "packet with extension" {
 
     const parsed_packet = try Self.parse(packet[0..]);
     try std.testing.expect(parsed_packet.header.extension);
-    try std.testing.expect(parsed_packet.header.extension_profile == 0xBDDE);
-    try std.testing.expectEqualSlices(u8, packet[16..28], parsed_packet.header.extensions.?);
+    try std.testing.expect(parsed_packet.extension.?.profile == 0xBDDE);
+    try std.testing.expectEqualSlices(u8, packet[16..28], parsed_packet.extension.?.data);
 }
 
 test "packet with padding" {
@@ -174,5 +164,5 @@ test "packet with padding" {
 
     const parsed_packet = try Self.parse(packet[0..]);
     try std.testing.expect(parsed_packet.header.padding);
-    try std.testing.expect(parsed_packet.header.padding_size == 4);
+    try std.testing.expect(parsed_packet.padding_size == 4);
 }
