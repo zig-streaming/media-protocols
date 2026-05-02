@@ -3,6 +3,20 @@ const rtp = @import("rtp");
 
 const Reader = std.Io.Reader;
 
+const methods = std.StaticStringMap(Method).initComptime(&.{
+    .{ "OPTIONS", Method.options },
+    .{ "DESCRIBE", Method.describe },
+    .{ "ANNOUNCE", Method.announce },
+    .{ "SETUP", Method.setup },
+    .{ "PLAY", Method.play },
+    .{ "PAUSE", Method.pause },
+    .{ "TEARDOWN", Method.teardown },
+    .{ "GET_PARAMETER", Method.get_parameter },
+    .{ "SET_PARAMETER", Method.set_parameter },
+    .{ "REDIRECT", Method.redirect },
+    .{ "RECORD", Method.record },
+});
+
 pub const uri_flags: std.Uri.Format.Flags = .{
     .authentication = false,
     .scheme = true,
@@ -123,7 +137,7 @@ pub const TransportHeader = struct {
     }
 };
 
-const StatusLine = struct {
+pub const StatusLine = struct {
     version: []const u8,
     status_code: u16,
     reason_phrase: []const u8,
@@ -145,11 +159,30 @@ const StatusLine = struct {
             .reason_phrase = std.mem.trimEnd(u8, reason_phrase, "\r\n"),
         };
     }
+
+    fn write(status_line: *const StatusLine, writer: *std.Io.Writer) !void {
+        try writer.writeAll("RTSP/1.0 ");
+        try writer.writeInt(u16, status_line.status_code, .big);
+        try writer.writeAll(status_line.reason_phrase);
+    }
 };
 
-const RequestLine = struct {
+pub const RequestLine = struct {
     method: Method,
     uri: std.Uri,
+
+    pub fn parse(line: []const u8) !RequestLine {
+        var iterator = std.mem.tokenizeScalar(u8, line, ' ');
+        const method = blk: {
+            if (iterator.next()) |str| {
+                if (methods.get(str)) |method| break :blk method else return error.ParseError;
+            } else return error.ParseError;
+        };
+        const uri = iterator.next() orelse return error.ParseError;
+        if (!std.mem.eql(u8, iterator.rest(), "RTSP/1.0")) return error.ParseError;
+
+        return .{ .method = method, .uri = std.Uri.parse(uri) catch return error.ParseError };
+    }
 
     pub fn write(self: *const RequestLine, path: ?[]const u8, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         _ = try writer.write(self.method.toString());
@@ -172,72 +205,80 @@ const RequestLine = struct {
     }
 };
 
-/// A lazy parser for RTSP responses that allows iterating through headers and body.
-pub const ResponseParser = struct {
-    status: u16,
+/// A lazy parser for RTSP messages.
+pub const Parser = struct {
     reader: *Reader,
     content_length: usize = 0,
-    parse_header: bool = true,
+    parse_state: ParseState = .first_line,
 
-    pub fn init(reader: *Reader) Error!ResponseParser {
-        var parser = ResponseParser{
-            .reader = reader,
-            .status = 0,
-        };
+    const ParseState = enum { first_line, header, body };
 
-        const line = parser.reader.takeDelimiterInclusive('\n') catch return error.ParseError;
-        const status_line = try StatusLine.parse(line);
-        parser.status = status_line.status_code;
-        return parser;
+    pub fn init(reader: *Reader) Parser {
+        return Parser{ .reader = reader };
     }
 
-    pub fn nextHeader(self: *ResponseParser) Error!?Header {
-        if (!self.parse_header) return null;
-        const line = self.reader.takeDelimiterInclusive('\n') catch return error.ParseError;
+    pub fn getRequestLine(parser: *Parser) Error!RequestLine {
+        if (parser.parse_state != .first_line) return error.ParseError;
+        const line = try readLine(parser.reader);
+        const result = try RequestLine.parse(line);
+        parser.parse_state = .header;
+        return result;
+    }
+
+    pub fn getResponseStatus(parser: *Parser) Error!StatusLine {
+        if (parser.parse_state != .first_line) return error.ParseError;
+        const line = parser.reader.takeDelimiterInclusive('\n') catch return error.ParseError;
+        const result = try StatusLine.parse(line);
+        parser.parse_state = .header;
+        return result;
+    }
+
+    pub fn nextHeader(parser: *Parser) Error!?Header {
+        if (parser.parse_state != .header) return error.ParseError;
+        const line = parser.reader.takeDelimiterInclusive('\n') catch return error.ParseError;
         if (line[0] == '\r') {
-            self.parse_header = false;
+            parser.parse_state = .body;
             return null;
         }
         const header = try Header.parse(line);
         if (std.mem.eql(u8, header.name, "Content-Length")) {
-            self.content_length = std.fmt.parseUnsigned(usize, header.value, 10) catch return error.ParseError;
+            parser.content_length = std.fmt.parseUnsigned(usize, header.value, 10) catch return error.ParseError;
         }
         return header;
     }
 
-    pub fn getBody(self: *ResponseParser) Error!?[]const u8 {
-        while (self.parse_header) _ = try self.nextHeader();
-        return if (self.content_length > 0) try self.reader.take(self.content_length) else null;
+    pub fn getBody(parser: *Parser) Error!?[]const u8 {
+        switch (parser.parse_state) {
+            .first_line => return error.ParseError,
+            .header => {
+                while (try parser.nextHeader()) |_| {}
+            },
+            else => {},
+        }
+
+        return if (parser.content_length > 0) try parser.reader.take(parser.content_length) else null;
     }
 
-    test "response parser" {
-        const response_text = "RTSP/1.0 200 OK\r\nCSeq: 2\r\nSession: 12345678\r\nContent-Length: 13\r\n\r\nHello, World!";
-        var reader = Reader.fixed(response_text);
-        var parser = try ResponseParser.init(&reader);
+    pub fn consume(parser: *Parser) Error!void {
+        loop: switch (parser.parse_state) {
+            .first_line => {
+                _ = try parser.getResponseStatus();
+                continue :loop .header;
+            },
+            .header => {
+                while (try parser.nextHeader()) |_| {}
+                continue :loop .body;
+            },
+            .body => {
+                _ = try parser.getBody();
+                return;
+            },
+        }
+    }
 
-        try std.testing.expectEqual(@as(u16, 200), parser.status);
-
-        var header = try parser.nextHeader();
-        try std.testing.expect(header != null);
-        try std.testing.expectEqualStrings("CSeq", header.?.name);
-        try std.testing.expectEqualStrings("2", header.?.value);
-
-        header = try parser.nextHeader();
-        try std.testing.expect(header != null);
-        try std.testing.expectEqualStrings("Session", header.?.name);
-        try std.testing.expectEqualStrings("12345678", header.?.value);
-
-        header = try parser.nextHeader();
-        try std.testing.expect(header != null);
-        try std.testing.expectEqualStrings("Content-Length", header.?.name);
-        try std.testing.expectEqualStrings("13", header.?.value);
-
-        header = try parser.nextHeader();
-        try std.testing.expect(header == null);
-
-        const body = try parser.getBody();
-        try std.testing.expect(body != null);
-        try std.testing.expectEqualStrings("Hello, World!", body.?);
+    fn readLine(reader: *Reader) ![]const u8 {
+        const line = reader.takeDelimiterInclusive('\n') catch return error.ParseError;
+        return std.mem.trimEnd(u8, line, "\r\n");
     }
 };
 
@@ -250,6 +291,10 @@ pub const Writer = struct {
 
     pub fn writeRequestLine(self: *Writer, path: ?[]const u8, request_line: RequestLine) std.Io.Writer.Error!void {
         try request_line.write(path, self.writer);
+    }
+
+    pub fn writeStatusLine(self: *Writer, status_line: StatusLine) std.Io.Writer.Error!void {
+        try status_line.write(self.writer);
     }
 
     pub fn writeHeader(self: *Writer, header: Header) std.Io.Writer.Error!void {
@@ -358,17 +403,19 @@ pub const TcpDemuxer = struct {
                 return .{ .rtcp = payload };
             }
         } else if (std.mem.eql(u8, h, "RTSP")) {
-            var parser = ResponseParser.init(reader) catch |err| switch (err) {
-                Reader.Error.EndOfStream => return null,
+            var parser = Parser.init(reader);
+
+            const resp_status = parser.getResponseStatus() catch |err| switch (err) {
+                error.EndOfStream => return null,
                 else => return error.ParseError,
             };
 
-            _ = parser.getBody() catch |err| switch (err) {
-                Reader.Error.EndOfStream => return null,
+            parser.consume() catch |err| switch (err) {
+                error.EndOfStream => return null,
                 else => return error.ParseError,
             };
 
-            return .{ .rtsp = parser.status };
+            return .{ .rtsp = resp_status.status_code };
         } else {
             return error.ParseError;
         }
@@ -534,6 +581,77 @@ test "DigestAuthParams: parse" {
     try auth_params.parse("Digest realm=\"RTSP\", nonce=\"abc123\"");
     try std.testing.expectEqualStrings("RTSP", auth_params.realm);
     try std.testing.expectEqualStrings("abc123", auth_params.nonce);
+}
+
+test "request line: invalid request" {
+    try std.testing.expectError(error.ParseError, RequestLine.parse("METHOD /url RTSP/1.0"));
+    try std.testing.expectError(error.ParseError, RequestLine.parse("DESCRIBE /hello RTSP/1.0"));
+    try std.testing.expectError(error.ParseError, RequestLine.parse("DESCRIBE rtsp://example.com/hello RTSP/1.1"));
+}
+
+test "response parser" {
+    const response_text = "RTSP/1.0 200 OK\r\nCSeq: 2\r\nSession: 12345678\r\nContent-Length: 13\r\n\r\nHello, World!";
+    var reader = Reader.fixed(response_text);
+    var parser = Parser.init(&reader);
+
+    const response_status = try parser.getResponseStatus();
+
+    try std.testing.expectEqual(200, response_status.status_code);
+
+    var header = try parser.nextHeader();
+    try std.testing.expect(header != null);
+    try std.testing.expectEqualStrings("CSeq", header.?.name);
+    try std.testing.expectEqualStrings("2", header.?.value);
+
+    header = try parser.nextHeader();
+    try std.testing.expect(header != null);
+    try std.testing.expectEqualStrings("Session", header.?.name);
+    try std.testing.expectEqualStrings("12345678", header.?.value);
+
+    header = try parser.nextHeader();
+    try std.testing.expect(header != null);
+    try std.testing.expectEqualStrings("Content-Length", header.?.name);
+    try std.testing.expectEqualStrings("13", header.?.value);
+
+    header = try parser.nextHeader();
+    try std.testing.expect(header == null);
+
+    const body = try parser.getBody();
+    try std.testing.expect(body != null);
+    try std.testing.expectEqualStrings("Hello, World!", body.?);
+}
+
+test "request parser" {
+    const response_text = "ANNOUNCE  rtsp://example.com/my/stream RTSP/1.0\nCSeq: 2\r\nSession: 12345678\r\nContent-Length: 13\r\n\r\nHello, World!";
+    var reader = Reader.fixed(response_text);
+    var parser = Parser.init(&reader);
+
+    const request_line = try parser.getRequestLine();
+
+    try std.testing.expectEqual(.announce, request_line.method);
+    try std.testing.expectEqualStrings("/my/stream", request_line.uri.path.percent_encoded);
+
+    var header = try parser.nextHeader();
+    try std.testing.expect(header != null);
+    try std.testing.expectEqualStrings("CSeq", header.?.name);
+    try std.testing.expectEqualStrings("2", header.?.value);
+
+    header = try parser.nextHeader();
+    try std.testing.expect(header != null);
+    try std.testing.expectEqualStrings("Session", header.?.name);
+    try std.testing.expectEqualStrings("12345678", header.?.value);
+
+    header = try parser.nextHeader();
+    try std.testing.expect(header != null);
+    try std.testing.expectEqualStrings("Content-Length", header.?.name);
+    try std.testing.expectEqualStrings("13", header.?.value);
+
+    header = try parser.nextHeader();
+    try std.testing.expect(header == null);
+
+    const body = try parser.getBody();
+    try std.testing.expect(body != null);
+    try std.testing.expectEqualStrings("Hello, World!", body.?);
 }
 
 test {
