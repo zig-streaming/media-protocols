@@ -20,9 +20,13 @@ pub const InitOptions = struct {
     initial_capacity: usize = initial_capacity,
 };
 
-const Error = error{Err};
-
 pub const VTable = struct {
+    /// Depacketize an rtp packet payload into a buffer.
+    ///
+    /// This function should return frame info which contains the number of written bytes into
+    /// the slice and if the packet contains a keyframe.
+    ///
+    /// If the buffer is not enough for the whole frame, the implementation should return `error.ShortBuffer`.
     depacketize: *const fn (*anyopaque, []const u8, []u8) anyerror!?FrameInfo,
 };
 
