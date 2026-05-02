@@ -4,7 +4,8 @@ const std = @import("std");
 const Reader = std.Io.Reader;
 const Self = @This();
 
-pub const Error = error{EndOfStream};
+pub const ParseError = error{EndOfStream};
+pub const WriteError = error{WriteFailed};
 
 /// Describes an RTP header.
 pub const Header = packed struct {
@@ -34,6 +35,12 @@ pub const Extension = struct {
             .data = ext_data,
         };
     }
+
+    fn write(ext: *const Extension, writer: *std.Io.Writer) !void {
+        try writer.writeInt(u16, ext.profile, .big);
+        try writer.writeInt(u16, @intCast(@divExact(ext.data.len, 4)), .big);
+        try writer.writeAll(ext.data);
+    }
 };
 
 header: Header,
@@ -43,7 +50,7 @@ payload: []const u8,
 padding_size: u8 = 0,
 
 /// Parses RTP Packet from slice
-pub fn parse(data: []const u8) Error!Self {
+pub fn parse(data: []const u8) ParseError!Self {
     var reader = std.Io.Reader.fixed(data);
     var packet: Self = .{
         .header = undefined,
@@ -67,6 +74,23 @@ pub fn parse(data: []const u8) Error!Self {
     packet.payload = data[reader.seek .. reader.end - packet.padding_size];
 
     return packet;
+}
+
+/// Serializes the rtp packet.
+pub fn write(packet: *const Self, writer: *std.Io.Writer) WriteError!void {
+    try writer.writeStruct(packet.header, .big);
+
+    const csrc_list: []const u8 = std.mem.sliceAsBytes(packet.csrc_list);
+    try writer.writeAll(csrc_list);
+
+    if (packet.extension) |ext| try ext.write(writer);
+
+    try writer.writeAll(packet.payload);
+    if (packet.header.padding) {
+        const pad: u8 = @intCast(4 - @rem(packet.payload.len, 4));
+        for (0..pad - 1) |_| try writer.writeByte(0);
+        try writer.writeByte(pad);
+    }
 }
 
 pub fn format(self: Self, writer: *std.Io.Writer) !void {
@@ -112,7 +136,7 @@ test "packet too short" {
     const short_packet: [10]u8 = [_]u8{ 0x80, 0xE0, 0x51, 0xA4, 0x00, 0x0D, 0xDF, 0x22, 0x54, 0xA7 };
 
     const result = Self.parse(short_packet[0..]);
-    try std.testing.expectError(Error.EndOfStream, result);
+    try std.testing.expectError(ParseError.EndOfStream, result);
 }
 
 test "packet with csrc" {
@@ -165,4 +189,132 @@ test "packet with padding" {
     const parsed_packet = try Self.parse(packet[0..]);
     try std.testing.expect(parsed_packet.header.padding);
     try std.testing.expect(parsed_packet.padding_size == 4);
+}
+
+test "write packet" {
+    const expected = [_]u8{
+        0x80, 0xE0, 0x51, 0xA4, 0x00, 0x0D, 0xDF,
+        0x22, 0x54, 0xA7, 0xD4, 0xF3, 0x01, 0x02,
+        0x03, 0x04,
+    };
+
+    const packet: Self = .{
+        .header = .{
+            .padding = false,
+            .extension = false,
+            .payload_type = 96,
+            .csrc_count = 0,
+            .sequence_number = 0x51A4,
+            .marker = true,
+            .timestamp = 0x000DDF22,
+            .ssrc = 0x54A7D4F3,
+        },
+        .payload = &[_]u8{ 0x01, 0x02, 0x03, 0x04 },
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try packet.write(&writer);
+    try std.testing.expectEqualSlices(u8, &expected, writer.buffered());
+}
+
+test "write packet with csrc" {
+    const expected = [_]u8{
+        0x83, 0x6F, 0x41, 0xFF, 0xD2,
+        0x14, 0x8B, 0xBA, 0x37, 0xB8,
+        0x30, 0x7F, 0x37, 0xB8, 0x30,
+        0x7F, 0x37, 0xB8, 0x30, 0x7E,
+        0x37, 0xB8, 0x30, 0x73, 0x00,
+        0x00, 0x05, 0x00, 0x09,
+    };
+
+    const packet: Self = .{
+        .header = .{
+            .padding = false,
+            .extension = false,
+            .payload_type = 111,
+            .csrc_count = 3,
+            .sequence_number = 0x41FF,
+            .marker = false,
+            .timestamp = 0xD2148BBA,
+            .ssrc = 0x37B8307F,
+        },
+        .csrc_list = std.mem.bytesAsSlice(u32, expected[12..24]),
+        .payload = &[_]u8{ 0x00, 0x00, 0x05, 0x00, 0x09 },
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try packet.write(&writer);
+    try std.testing.expectEqualSlices(u8, &expected, writer.buffered());
+}
+
+test "write packet with extension" {
+    const expected = [_]u8{
+        0x90, 0x6F, 0x41, 0xFF, 0xD2, 0x14,
+        0x8B, 0xBA, 0x37, 0xB8, 0x30, 0x7F,
+        0xBD, 0xDE, 0x00, 0x03, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x05, 0x00, 0x09,
+    };
+
+    const packet: Self = .{
+        .header = .{
+            .padding = false,
+            .extension = true,
+            .payload_type = 111,
+            .csrc_count = 0,
+            .sequence_number = 0x41FF,
+            .marker = false,
+            .timestamp = 0xD2148BBA,
+            .ssrc = 0x37B8307F,
+        },
+        .extension = .{
+            .profile = 0xBDDE,
+            .data = expected[16..28],
+        },
+        .payload = expected[28..33],
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try packet.write(&writer);
+    try std.testing.expectEqualSlices(u8, &expected, writer.buffered());
+}
+
+test "write packet with padding" {
+    const expected = [_]u8{
+        0xB3, 0x6F, 0x41, 0xFF, 0xD2, 0x14, 0x8B,
+        0xBA, 0x37, 0xB8, 0x30, 0x7F, 0x37, 0xB8,
+        0x30, 0x7F, 0x37, 0xB8, 0x30, 0x7E, 0x37,
+        0xB8, 0x30, 0x73, 0xBD, 0xDE, 0x00, 0x03,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00,
+        0x09, 0x00, 0x00, 0x00, 0x00, 0x04,
+    };
+
+    const packet: Self = .{
+        .header = .{
+            .padding = true,
+            .extension = true,
+            .payload_type = 111,
+            .csrc_count = 3,
+            .sequence_number = 0x41FF,
+            .marker = false,
+            .timestamp = 0xD2148BBA,
+            .ssrc = 0x37B8307F,
+        },
+        .csrc_list = std.mem.bytesAsSlice(u32, expected[12..24]),
+        .extension = .{
+            .profile = 0xBDDE,
+            .data = expected[28..40],
+        },
+        .payload = expected[40..44],
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try packet.write(&writer);
+    try std.testing.expectEqualSlices(u8, &expected, writer.buffered());
 }

@@ -42,13 +42,23 @@ pub fn build(b: *std.Build) void {
     });
 
     {
-        const rtp_tests = b.addTest(.{ .root_module = rtp });
+        const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match any filter") orelse &[0][]const u8{};
+        const rtp_tests = b.addTest(.{
+            .root_module = rtp,
+            .filters = test_filters,
+        });
         const run_rtp_tests = b.addRunArtifact(rtp_tests);
 
-        const sdp_tests = b.addTest(.{ .root_module = sdp });
+        const sdp_tests = b.addTest(.{
+            .root_module = sdp,
+            .filters = test_filters,
+        });
         const run_sdp_tests = b.addRunArtifact(sdp_tests);
 
-        const rtsp_tests = b.addTest(.{ .root_module = rtsp });
+        const rtsp_tests = b.addTest(.{
+            .root_module = rtsp,
+            .filters = test_filters,
+        });
         const run_rtsp_tests = b.addRunArtifact(rtsp_tests);
 
         const test_step = b.step("test", "Run tests");
