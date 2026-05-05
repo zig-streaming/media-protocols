@@ -1,76 +1,23 @@
+pub const Server = @import("server.zig");
+
 const std = @import("std");
 const rtp = @import("rtp");
 
 const Reader = std.Io.Reader;
 
-const methods = std.StaticStringMap(Method).initComptime(&.{
-    .{ "OPTIONS", Method.options },
-    .{ "DESCRIBE", Method.describe },
-    .{ "ANNOUNCE", Method.announce },
-    .{ "SETUP", Method.setup },
-    .{ "PLAY", Method.play },
-    .{ "PAUSE", Method.pause },
-    .{ "TEARDOWN", Method.teardown },
-    .{ "GET_PARAMETER", Method.get_parameter },
-    .{ "SET_PARAMETER", Method.set_parameter },
-    .{ "REDIRECT", Method.redirect },
-    .{ "RECORD", Method.record },
-});
-
-pub const uri_flags: std.Uri.Format.Flags = .{
-    .authentication = false,
-    .scheme = true,
-    .authority = true,
-    .path = true,
-    .query = true,
-    .fragment = true,
-};
-
 pub const Error = error{
     ParseError,
 } || std.mem.Allocator.Error || Reader.Error;
 
-pub const Method = enum {
-    options,
-    describe,
-    announce,
-    setup,
-    play,
-    pause,
-    teardown,
-    get_parameter,
-    set_parameter,
-    redirect,
-    record,
+pub const Status = enum(u10) {
+    ok = 200,
+    _,
 
-    pub fn toString(self: *const Method) []const u8 {
-        return switch (self.*) {
-            .options => "OPTIONS",
-            .describe => "DESCRIBE",
-            .announce => "ANNOUNCE",
-            .setup => "SETUP",
-            .play => "PLAY",
-            .pause => "PAUSE",
-            .teardown => "TEARDOWN",
-            .get_parameter => "GET_PARAMETER",
-            .set_parameter => "SET_PARAMETER",
-            .redirect => "REDIRECT",
-            .record => "RECORD",
+    pub fn phrase(self: Status) ?[]const u8 {
+        return switch (self) {
+            .ok => "OK",
+            else => null,
         };
-    }
-
-    test "toString" {
-        try std.testing.expectEqualStrings("OPTIONS", Method.options.toString());
-        try std.testing.expectEqualStrings("DESCRIBE", Method.describe.toString());
-        try std.testing.expectEqualStrings("ANNOUNCE", Method.announce.toString());
-        try std.testing.expectEqualStrings("SETUP", Method.setup.toString());
-        try std.testing.expectEqualStrings("PLAY", Method.play.toString());
-        try std.testing.expectEqualStrings("PAUSE", Method.pause.toString());
-        try std.testing.expectEqualStrings("TEARDOWN", Method.teardown.toString());
-        try std.testing.expectEqualStrings("GET_PARAMETER", Method.get_parameter.toString());
-        try std.testing.expectEqualStrings("SET_PARAMETER", Method.set_parameter.toString());
-        try std.testing.expectEqualStrings("REDIRECT", Method.redirect.toString());
-        try std.testing.expectEqualStrings("RECORD", Method.record.toString());
     }
 };
 
@@ -119,10 +66,114 @@ pub const Header = struct {
     }
 };
 
+const methods = std.StaticStringMap(Method).initComptime(&.{
+    .{ "OPTIONS", Method.options },
+    .{ "DESCRIBE", Method.describe },
+    .{ "ANNOUNCE", Method.announce },
+    .{ "SETUP", Method.setup },
+    .{ "PLAY", Method.play },
+    .{ "PAUSE", Method.pause },
+    .{ "TEARDOWN", Method.teardown },
+    .{ "GET_PARAMETER", Method.get_parameter },
+    .{ "SET_PARAMETER", Method.set_parameter },
+    .{ "REDIRECT", Method.redirect },
+    .{ "RECORD", Method.record },
+});
+
+pub const uri_flags: std.Uri.Format.Flags = .{
+    .authentication = false,
+    .scheme = true,
+    .authority = true,
+    .path = true,
+    .query = true,
+    .fragment = true,
+};
+
+pub const Method = enum {
+    options,
+    describe,
+    announce,
+    setup,
+    play,
+    pause,
+    teardown,
+    get_parameter,
+    set_parameter,
+    redirect,
+    record,
+
+    pub fn toString(self: *const Method) []const u8 {
+        return switch (self.*) {
+            .options => "OPTIONS",
+            .describe => "DESCRIBE",
+            .announce => "ANNOUNCE",
+            .setup => "SETUP",
+            .play => "PLAY",
+            .pause => "PAUSE",
+            .teardown => "TEARDOWN",
+            .get_parameter => "GET_PARAMETER",
+            .set_parameter => "SET_PARAMETER",
+            .redirect => "REDIRECT",
+            .record => "RECORD",
+        };
+    }
+
+    test "toString" {
+        try std.testing.expectEqualStrings("OPTIONS", Method.options.toString());
+        try std.testing.expectEqualStrings("DESCRIBE", Method.describe.toString());
+        try std.testing.expectEqualStrings("ANNOUNCE", Method.announce.toString());
+        try std.testing.expectEqualStrings("SETUP", Method.setup.toString());
+        try std.testing.expectEqualStrings("PLAY", Method.play.toString());
+        try std.testing.expectEqualStrings("PAUSE", Method.pause.toString());
+        try std.testing.expectEqualStrings("TEARDOWN", Method.teardown.toString());
+        try std.testing.expectEqualStrings("GET_PARAMETER", Method.get_parameter.toString());
+        try std.testing.expectEqualStrings("SET_PARAMETER", Method.set_parameter.toString());
+        try std.testing.expectEqualStrings("REDIRECT", Method.redirect.toString());
+        try std.testing.expectEqualStrings("RECORD", Method.record.toString());
+    }
+};
+
 pub const TransportHeader = struct {
     proto: enum { tcp, udp } = .udp,
+    /// False means multicast
     unicast: bool = true,
     interleaved: ?struct { u8, u8 } = null,
+
+    pub const TransportError = error{InvalidTransportHeader};
+
+    pub fn parse(header_value: []const u8) TransportError!TransportHeader {
+        var it = std.mem.splitScalar(u8, header_value, ';');
+        var transport: TransportHeader = .{};
+
+        const protocol = it.next().?;
+        if (std.mem.eql(u8, protocol, "RTP/AVP")) {
+            transport.proto = .udp;
+        } else if (std.mem.eql(u8, protocol, "RTP/AVP/UDP")) {
+            transport.proto = .udp;
+        } else if (std.mem.eql(u8, protocol, "RTP/AVP/TCP")) {
+            transport.proto = .tcp;
+        } else {
+            return error.InvalidTransportHeader;
+        }
+
+        while (it.next()) |parameter| {
+            if (std.mem.eql(u8, parameter, "unicast")) {
+                transport.unicast = true;
+            } else if (std.mem.eql(u8, parameter, "multicast")) {
+                transport.unicast = false;
+            } else if (std.mem.startsWith(u8, parameter, "interleaved=")) {
+                var interleaved_it = std.mem.splitScalar(u8, parameter[12..], '-');
+                transport.interleaved = .{
+                    std.fmt.parseInt(u8, interleaved_it.next().?, 10) catch return error.InvalidTransportHeader,
+                    std.fmt.parseInt(u8, interleaved_it.rest(), 10) catch return error.InvalidTransportHeader,
+                };
+            }
+        }
+
+        if (transport.proto == .tcp and transport.interleaved == null) return error.InvalidTransportHeader;
+
+        return transport;
+    }
 
     pub fn write(self: *const TransportHeader, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeAll(if (self.proto == .tcp) "RTP/AVP/TCP" else "RTP/AVP");
@@ -134,6 +185,13 @@ pub const TransportHeader = struct {
         if (self.interleaved) |interleaved| {
             try writer.print(";interleaved={}-{}", .{ interleaved.@"0", interleaved.@"1" });
         }
+    }
+
+    test "parse transport header" {
+        const transport = try parse("RTP/AVP/TCP;unicast;interleaved=0-1");
+        try std.testing.expect(transport.unicast);
+        try std.testing.expectEqual(.tcp, transport.proto);
+        try std.testing.expectEqual(.{ 0, 1 }, transport.interleaved);
     }
 };
 
@@ -660,4 +718,5 @@ test "request parser" {
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("server.zig");
 }
