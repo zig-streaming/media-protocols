@@ -32,6 +32,7 @@ pub const Origin = struct {
 pub fn parse(buffer: []const u8) !Self {
     var reader = Io.Reader.fixed(buffer);
     var state: State = .V;
+    var valid_header = false;
 
     var version: u8 = 0;
     var origin: Origin = undefined;
@@ -46,6 +47,10 @@ pub fn parse(buffer: []const u8) !Self {
         const line_offset = reader.seek;
         var line = readLine(&reader) catch |err| switch (err) {
             error.EndOfStream => {
+                if (!valid_header) {
+                    return error.InvalidSDP;
+                }
+
                 return .{
                     .version = version,
                     .origin = origin,
@@ -88,6 +93,7 @@ pub fn parse(buffer: []const u8) !Self {
                     return error.InvalidSessionName;
                 }
 
+                valid_header = true;
                 state = .I;
                 continue :read;
             },
