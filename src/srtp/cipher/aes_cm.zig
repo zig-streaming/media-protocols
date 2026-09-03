@@ -86,7 +86,7 @@ pub fn encryptRtcp(cm: *AesCm, src: []const u8, dst: []u8, index: u32) []const u
     cm.generateRtcpIV(&iv, src[4..8], index);
 
     ctr(@TypeOf(cm.rtcp_enc_ctx), cm.rtcp_enc_ctx, dst[8..], src[8..], iv, .big);
-    @memcpy(dst[0..8], src[0..8]);
+    if (dst.ptr != src.ptr) @memcpy(dst[0..8], src[0..8]);
     std.mem.writeInt(u32, dst[src.len..][0..rtcp_index_size], index | 0x80000000, .big);
 
     var hash: [HmacSha1.mac_length]u8 = undefined;
@@ -107,11 +107,10 @@ pub fn decryptRtp(cm: *AesCm, roc: u32, header_size: usize, src: []const u8, dst
     hasher.final(&hash);
 
     if (std.crypto.timing_safe.compare(u8, hash[0..tag_size], src[src.len - tag_size ..], .big) != .eq) {
-        @branchHint(.unlikely);
+        @branchHint(.cold);
         return error.AuthenticationFailed;
     }
 
-    // Decrypt
     var iv: [enc_key_size]u8 = @splat(0);
     cm.generateRtpIV(&iv, src, &roc_bytes);
 
@@ -151,7 +150,7 @@ pub fn decryptRtcp(cm: *AesCm, src: []const u8, dst: []u8, encrypted: bool, inde
     cm.generateRtcpIV(&iv, src[4..8], index);
 
     ctr(@TypeOf(cm.rtcp_enc_ctx), cm.rtcp_enc_ctx, dst[8..], src[8..payload_size], iv, .big);
-    @memcpy(dst[0..8], src[0..8]);
+    if (dst.ptr != src.ptr) @memcpy(dst[0..8], src[0..8]);
     return dst[0..payload_size];
 }
 
@@ -218,7 +217,7 @@ test "AesCm: encrypt/decrypt rtp in place" {
     try std.testing.expectEqualSlices(u8, &plain_rtp, decrypted);
 }
 
-test "encrypt/decrypt rtcp" {
+test "AesCm: encrypt/decrypt rtcp" {
     var master_key: [enc_key_size]u8 = undefined;
     var master_salt: [enc_key_size]u8 = undefined;
 
@@ -232,6 +231,26 @@ test "encrypt/decrypt rtcp" {
     for (0..1000) |idx| {
         const encrypted = cm.encryptRtcp(&plain_rtcp, &enc_dst, @intCast(idx));
         const decrypted = try cm.decryptRtcp(encrypted, &dec_dst, true, @intCast(idx));
+
+        try std.testing.expectEqualSlices(u8, &plain_rtcp, decrypted);
+    }
+}
+
+test "AesCm: encrypt/decrypt rtcp in place" {
+    var master_key: [enc_key_size]u8 = undefined;
+    var master_salt: [enc_key_size]u8 = undefined;
+
+    std.testing.io.random(&master_key);
+    std.testing.io.random(&master_salt);
+
+    var cm = AesCm.init(.AesCm128HmacSha1_80, &master_key, &master_salt);
+
+    var buffer: [200]u8 = undefined;
+    @memcpy(buffer[0..plain_rtcp.len], &plain_rtcp);
+
+    for (0..1000) |idx| {
+        const encrypted = cm.encryptRtcp(buffer[0..plain_rtcp.len], &buffer, @intCast(idx));
+        const decrypted = try cm.decryptRtcp(encrypted, &buffer, true, @intCast(idx));
 
         try std.testing.expectEqualSlices(u8, &plain_rtcp, decrypted);
     }
