@@ -22,9 +22,6 @@ const HostName = Io.net.HostName;
 
 pub const max_message_size = 1500;
 
-const connectivity_check_interval: std.Io.Duration = .fromMilliseconds(200);
-const keep_alive_interval: std.Io.Duration = .fromSeconds(4);
-
 /// Struct describing the configuration of the agent
 pub const AgentConfig = struct {
     /// Local credentials of the agent (ufrag and password)
@@ -86,14 +83,14 @@ const Channel = union(enum) {
         };
     }
 
-    fn receiveTimeout(channel: Channel, io: Io, buffer: []u8, timeout: Io.Timeout) !struct { IpAddress, []const u8 } {
+    fn receive(channel: Channel, io: Io, buffer: []u8) !struct { IpAddress, []const u8 } {
         switch (channel) {
             .socket => |s| {
-                const incoming_message = try s.receiveTimeout(io, buffer, timeout);
+                const incoming_message = try s.receive(io, buffer);
                 return .{ incoming_message.from, incoming_message.data };
             },
             .relay => |c| {
-                const received = try c.receiveTimeout(io, buffer, timeout);
+                const received = try c.receive(io, buffer);
                 return .{ received.from, received.data };
             },
         }
@@ -121,16 +118,12 @@ const InnerEvent = union(enum) {
         relay: *stun.TurnClient,
     },
     remote_candidate: Candidate,
-    complete: void,
     connection_state: ice.ConnectionState,
     gathering_state: ice.GatheringState,
     role: ice.Role,
     close: void,
 };
 
-// Timeouts config
-disconnected_timeout: u32,
-failed_timeout: u32,
 network_types: ice.NetworkTypes,
 
 io: Io,
@@ -178,11 +171,15 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
     errdefer allocator.free(queue_buffer);
 
     return .{
-        .disconnected_timeout = config.disconnected_timeout,
-        .failed_timeout = config.failed_timeout,
         .network_types = config.network_types,
         .io = io,
-        .core = .init(allocator, config.role, credens, randomNumber(u64, io)),
+        .core = .init(allocator, .{
+            .role = config.role,
+            .credentials = credens,
+            .tie_breaker = randomNumber(u64, io),
+            .failed_timeout = config.failed_timeout,
+            .disconnected_timeout = config.disconnected_timeout,
+        }),
         .ice_servers = config.ice_servers,
         .buffer_pool = try .initCapacity(allocator, 8),
         .queue_buffer = queue_buffer,
@@ -222,16 +219,11 @@ pub fn addRemoteCandidate(agent: *Agent, remote_candidate: Candidate) !void {
 /// Calling this function will trigger connectivity checks. `gatherCandidates` should be called first.
 pub fn setRemoteCredentials(agent: *Agent, credentials: ice.Credentials) !void {
     try agent.ensureStarted();
-    switch (agent.core.connection_state) {
-        .new => {
-            const credens = try credentials.dupe(agent.core.allocator);
-            if (agent.core.remote_credentials == null) {
-                try agent.group.concurrent(agent.io, connectivityCheck, .{ agent, connectivity_check_interval });
-            }
-            agent.core.remote_credentials = credens;
-            agent.setConnectionState(.checking);
-        },
-        else => return error.CredentialsAlreadySet,
+    const have_credens = agent.core.remote_credentials != null;
+    try agent.core.setRemoteCredentials(credentials);
+
+    if (!have_credens) {
+        try agent.group.concurrent(agent.io, timeoutHandler, .{agent});
     }
 }
 
@@ -385,7 +377,13 @@ fn poll(agent: *Agent) !void {
             {
                 agent.mutex.lockUncancelable(io);
                 defer agent.mutex.unlock(io);
-                agent.core.handleInput(&message.channel.address(), &message.incoming_message.from, message.incoming_message.data, buffer) catch |err| switch (err) {
+                var input_msg = Core.Message.init(
+                    &message.incoming_message.from,
+                    &message.channel.address(),
+                    message.incoming_message.data,
+                );
+                input_msg.timestamp = Io.Timestamp.now(io, .awake).toMilliseconds();
+                agent.core.handleInput(input_msg, buffer) catch |err| switch (err) {
                     error.SwitchRole => {
                         agent.core.toggleRole(randomNumber(u64, io));
                         continue;
@@ -394,32 +392,26 @@ fn poll(agent: *Agent) !void {
                 };
             }
 
-            while (agent.core.pollEvent()) |core_event| switch (core_event) {
-                .response => |resp| try message.channel.send(agent, &message.incoming_message.from, resp.data),
+            while (blk: {
+                agent.mutex.lockUncancelable(io);
+                defer agent.mutex.unlock(io);
+                break :blk agent.core.pollEvent();
+            }) |core_event| switch (core_event) {
+                .message => |resp| try message.channel.send(agent, &message.incoming_message.from, resp.data),
                 .data => |data| try agent.on_data(agent.userdata, agent, data),
                 .nominated => agent.nominated_channel = message.channel,
-                .connection_state => {
-                    try agent.group.concurrent(io, markConnectionCompleted, .{ agent, .fromSeconds(3) });
-                    try agent.group.concurrent(io, keepAlive, .{ agent, keep_alive_interval });
-                    try agent.on_event(agent.userdata, agent, .{ .connection_state = agent.core.connection_state });
-                },
+                .connection_state => try agent.on_event(agent.userdata, agent, .{ .connection_state = agent.core.connection_state }),
+                else => {},
             };
         },
         .connection_state => |state| {
             if (state == .failed) agent.failConnection();
+            if (state == .completed) agent.pruneNonNominatedRelayClients();
             try agent.on_event(agent.userdata, agent, .{ .connection_state = state });
         },
         .gathering_state => |state| {
             agent.core.gathering_state = state;
             try agent.on_event(agent.userdata, agent, .{ .gathering_state = state });
-        },
-        .complete => {
-            if (agent.core.connection_state != .connected) continue;
-            agent.setConnectionState(.completed);
-            agent.core.onComplete();
-            agent.pruneNonNominatedRelayClients();
-
-            try agent.on_event(agent.userdata, agent, .{ .connection_state = .completed });
         },
         .role => |r| if (agent.core.role != r) agent.core.toggleRole(agent.core.tie_breaker),
         .close => {
@@ -442,6 +434,8 @@ fn closeConnection(agent: *Agent) void {
 }
 
 fn failConnection(agent: *Agent) void {
+    agent.group.cancel(agent.io);
+
     const allocator = agent.core.allocator;
     agent.sockets.clearAndFree(allocator);
 
@@ -704,24 +698,26 @@ fn setConnectionState(agent: *Agent, new_state: ice.ConnectionState) void {
     agent.core.connection_state = new_state;
 }
 
-fn connectivityCheck(agent: *Agent, timeout: Io.Duration) !void {
-    var dur = Io.Duration{ .nanoseconds = 0 };
-    const failed_timeout = Io.Duration.fromMilliseconds(agent.failed_timeout);
-
+fn timeoutHandler(agent: *Agent) !void {
+    const io = agent.io;
     while (true) {
-        switch (agent.core.connection_state) {
-            .completed, .failed, .closed => return,
-            else => |state| {
-                try agent.io.sleep(timeout, .awake);
-                dur.nanoseconds += timeout.nanoseconds;
-                if (state != .connected and dur.nanoseconds > failed_timeout.nanoseconds) {
-                    agent.setConnectionState(.failed);
-                    try agent.putInQueue(.{ .connection_state = .failed });
-                    return;
-                }
-                try agent.putInQueue(.{ .connectivity_check = {} });
-            },
-        }
+        const now = Io.Timestamp.now(io, .awake).toMilliseconds();
+        const next_deadline = blk: {
+            agent.mutex.lockUncancelable(io);
+            defer agent.mutex.unlock(io);
+            break :blk agent.core.handleTimeout(now) catch return;
+        };
+        while (blk: {
+            agent.mutex.lockUncancelable(io);
+            defer agent.mutex.unlock(io);
+            break :blk agent.core.pollEvent();
+        }) |event| switch (event) {
+            .connectivity_check => try agent.putInQueue(.connectivity_check),
+            .consent_freshness => agent.sendConsentFreshness() catch return,
+            .connection_state => |state| try agent.putInQueue(.{ .connection_state = state }),
+            else => {},
+        };
+        try io.sleep(.fromMilliseconds(next_deadline - now), .awake);
     }
 }
 
@@ -767,7 +763,7 @@ fn doReceive(agent: *Agent, socket: *const Socket) !void {
 }
 
 fn receiveAppData(agent: *Agent, channel: Channel) !void {
-    var timeout: Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(agent.disconnected_timeout) } };
+    const io = agent.io;
     const buffer = agent.createPacket() catch {
         try agent.putInQueue(.close);
         return;
@@ -775,14 +771,7 @@ fn receiveAppData(agent: *Agent, channel: Channel) !void {
     defer agent.destroyPacket(buffer);
 
     while (true) {
-        const from, const data = channel.receiveTimeout(agent.io, buffer, timeout) catch |err| switch (err) {
-            error.Timeout => {
-                const new_state = agent.core.onConsentTimeout() orelse return;
-                try agent.putInQueue(.{ .connection_state = new_state });
-                if (new_state != .disconnected) return; // .failed
-                timeout.duration.raw = .fromMilliseconds(agent.failed_timeout);
-                continue;
-            },
+        const from, const data = channel.receive(io, buffer) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             else => |e| {
                 logError("Error when listening: {}", .{e});
@@ -790,11 +779,18 @@ fn receiveAppData(agent: *Agent, channel: Channel) !void {
             },
         };
 
+        const now = Io.Timestamp.now(io, .awake).toMilliseconds();
         if (agent.core.connection_state == .disconnected) {
             @branchHint(.cold);
-            timeout.duration.raw = .fromMilliseconds(agent.disconnected_timeout);
-            agent.setConnectionState(.completed);
+            {
+                agent.mutex.lockUncancelable(io);
+                defer agent.mutex.unlock(io);
+                agent.core.connection_state = .completed;
+                agent.core.disconnected_connection_deadline = now + @as(i64, agent.core.disconnected_timeout);
+            }
             try agent.putInQueue(.{ .connection_state = .completed });
+        } else {
+            agent.core.disconnected_connection_deadline = now + @as(i64, agent.core.disconnected_timeout);
         }
 
         if (stun.isMessage(data)) {
@@ -803,14 +799,6 @@ fn receiveAppData(agent: *Agent, channel: Channel) !void {
             @branchHint(.likely);
             try agent.on_data(agent.userdata, agent, data);
         }
-    }
-}
-
-fn keepAlive(agent: *Agent, timeout: Io.Duration) !void {
-    const io = agent.io;
-    while (true) {
-        try io.sleep(timeout, .awake);
-        agent.sendConsentFreshness() catch return;
     }
 }
 
@@ -870,11 +858,6 @@ fn handleConsentFreshness(agent: *Agent, from: *const IpAddress, data: []const u
     if (try agent.core.handleConsentFreshness(from, data, buffer)) |resp| {
         try agent.nominated_channel.?.send(agent, from, resp);
     }
-}
-
-fn markConnectionCompleted(agent: *Agent, timeout: Io.Duration) !void {
-    try agent.io.sleep(timeout, .awake);
-    try agent.putInQueue(.complete);
 }
 
 fn logError(comptime fmt: []const u8, args: anytype) void {

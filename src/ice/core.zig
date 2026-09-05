@@ -16,20 +16,31 @@ const SelectedPair = struct {
     remote: Candidate,
 };
 
+pub const Message = struct {
+    from: *const IpAddress,
+    to: *const IpAddress,
+    data: []const u8,
+    timestamp: i64 = 0,
+
+    pub fn init(from: *const IpAddress, to: *const IpAddress, data: []const u8) Message {
+        return .{ .from = from, .to = to, .data = data };
+    }
+};
+
 pub const Event = union(enum) {
     connection_state: ice.ConnectionState,
     nominated: void,
-    response: struct {
-        data: []const u8,
-        base: *const IpAddress,
-        dest: *const IpAddress,
-    },
+    message: Message,
     data: []const u8,
+    connectivity_check: void,
+    consent_freshness: void,
 };
 
 /// The maximum number of binding requests sent on a pair before it is
 /// considered failed.
 pub const max_binding_requests: usize = 7;
+pub const connectivity_check_interval: i64 = 200;
+pub const keep_alive_interval: i64 = 4_000;
 
 allocator: std.mem.Allocator,
 connection_state: ice.ConnectionState = .new,
@@ -51,6 +62,12 @@ selected_pair: ?SelectedPair = null,
 // This the final pair selected by this agent or the remote one.
 nominated_pair: ?SelectedPair = null,
 
+connectivity_check_deadline: i64,
+disconnected_connection_deadline: i64,
+failed_connection_deadline: i64,
+keep_alive_deadline: i64,
+failed_timeout: u32,
+disconnected_timeout: u32,
 events_out: std.Deque(Event),
 
 const PendingRequest = struct {
@@ -130,12 +147,26 @@ pub const ConnectivityChecks = struct {
     }
 };
 
-pub fn init(allocator: std.mem.Allocator, role: ice.Role, credentials: ice.Credentials, tie_breaker: u64) Core {
+pub const Config = struct {
+    role: ice.Role,
+    credentials: ice.Credentials,
+    tie_breaker: u64,
+    failed_timeout: u32 = 25000,
+    disconnected_timeout: u32 = 5000,
+};
+
+pub fn init(allocator: std.mem.Allocator, config: Config) Core {
     return .{
         .allocator = allocator,
-        .role = role,
-        .credentials = credentials,
-        .tie_breaker = tie_breaker,
+        .role = config.role,
+        .credentials = config.credentials,
+        .tie_breaker = config.tie_breaker,
+        .connectivity_check_deadline = 0,
+        .keep_alive_deadline = 0,
+        .failed_connection_deadline = 0,
+        .disconnected_connection_deadline = 0,
+        .failed_timeout = config.failed_timeout,
+        .disconnected_timeout = config.disconnected_timeout,
         .events_out = .empty,
     };
 }
@@ -156,14 +187,9 @@ pub fn deinit(core: *Core) void {
     core.connection_state = .closed;
 }
 
-/// Release the connectivity-check bookkeeping once the connection is complete.
-///
-/// The nominated pair is kept (it lives in its own field); the checklist,
-/// remote candidates and pending requests are no longer needed.
-pub fn onComplete(core: *Core) void {
-    core.remote_candidates.clearAndFree(core.allocator);
-    core.pairs.clearAndFree(core.allocator);
-    core.pending_requests.clearAndFree(core.allocator);
+pub fn setRemoteCredentials(core: *Core, credentials: ice.Credentials) !void {
+    if (core.remote_credentials) |*remote| remote.deinit(core.allocator);
+    core.remote_credentials = try credentials.dupe(core.allocator);
 }
 
 pub fn addHostCandidate(core: *Core, addr: std.Io.net.IpAddress) !?Candidate {
@@ -254,9 +280,16 @@ pub fn beginConnectivityChecks(core: *Core) ?ConnectivityChecks {
     return .{ .core = core };
 }
 
-pub fn handleInput(core: *Core, base: *const IpAddress, sender: *const IpAddress, data: []const u8, buffer: []u8) !void {
-    if (!stun.isMessage(data)) {
-        try core.handleAppData(sender, data);
+pub fn handleTimeout(core: *Core, now: i64) std.mem.Allocator.Error!i64 {
+    const ck_deadline = try core.nextConnectivityCheckInterval(now);
+    const ka_deadline = try core.nextKeepAliveInterval(now);
+    const ct_deadline = try core.nextConnectionTimeout(now);
+    return @min(@min(ck_deadline, ka_deadline), ct_deadline);
+}
+
+pub fn handleInput(core: *Core, message: Message, buffer: []u8) !void {
+    if (!stun.isMessage(message.data)) {
+        try core.handleAppData(message.from, message.data);
         return;
     }
 
@@ -265,23 +298,22 @@ pub fn handleInput(core: *Core, base: *const IpAddress, sender: *const IpAddress
         else => {},
     }
 
-    const msg = try stun.Message.parse(data);
+    const msg = try stun.Message.parse(message.data);
 
     switch (msg.header.message_type.class()) {
         .request => {
-            const resp = try core.handleRequest(&msg, base, sender, buffer);
+            const resp = try core.handleRequest(&msg, message.to, message.from, buffer);
             if (core.detectNominatedPair() != null) try core.events_out.pushBack(core.allocator, .nominated);
-            try core.events_out.pushBack(core.allocator, .{ .response = .{ .data = resp, .base = base, .dest = sender } });
+            try core.events_out.pushBack(core.allocator, .{ .message = .init(message.to, message.from, resp) });
         },
         .success_response => {
-            try core.handleSuccessResponse(&msg, base.*, sender.*);
-            try core.events_out.pushBack(core.allocator, .{ .response = .{ .data = data, .base = base, .dest = sender } });
+            try core.handleSuccessResponse(&msg, message.to.*, message.from.*);
             if (core.detectNominatedPair() != null) try core.events_out.pushBack(core.allocator, .nominated);
         },
         else => {},
     }
 
-    if (core.markConnected()) try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
+    if (core.markConnected(message.timestamp)) try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
 }
 
 pub fn pollEvent(core: *Core) ?Event {
@@ -302,26 +334,14 @@ pub fn detectNominatedPair(core: *Core) ?CandidatePair {
     return null;
 }
 
-pub fn markConnected(core: *Core) bool {
+pub fn markConnected(core: *Core, now: i64) bool {
     if (core.nominated_pair != null and core.connection_state != .connected) {
         core.connection_state = .connected;
+        core.keep_alive_deadline = now + keep_alive_interval;
+        core.disconnected_connection_deadline = now + core.disconnected_timeout;
         return true;
     }
     return false;
-}
-
-pub fn onConsentTimeout(core: *Core) ?ice.ConnectionState {
-    switch (core.connection_state) {
-        .connected, .completed => {
-            core.connection_state = .disconnected;
-            return .disconnected;
-        },
-        .disconnected => {
-            core.connection_state = .failed;
-            return .failed;
-        },
-        else => return null,
-    }
 }
 
 pub fn buildBindingRequest(core: *Core, tx_id: u96, use_candidate: bool, buffer: []u8) ![]const u8 {
@@ -358,6 +378,93 @@ pub fn toggleRole(core: *Core, tie_breaker: u64) void {
         const local = core.getPairLocal(pair);
         const remote = core.getPairRemote(pair);
         pair.priority = calculatePairPriority(local.priority, remote.priority, core.role);
+    }
+}
+
+fn onComplete(core: *Core) void {
+    core.connection_state = .completed;
+    core.remote_candidates.clearAndFree(core.allocator);
+    core.pairs.clearAndFree(core.allocator);
+    core.pending_requests.clearAndFree(core.allocator);
+}
+
+fn nextConnectivityCheckInterval(core: *Core, now: i64) !i64 {
+    switch (core.connection_state) {
+        .new => {
+            core.connection_state = .checking;
+            core.connectivity_check_deadline = now + connectivity_check_interval;
+            core.failed_connection_deadline = now + @as(i64, core.failed_timeout);
+            try core.events_out.pushBack(core.allocator, .connectivity_check);
+            return core.connectivity_check_deadline;
+        },
+        .checking, .connected => {
+            if (now >= core.connectivity_check_deadline) {
+                core.connectivity_check_deadline = now + connectivity_check_interval;
+                try core.events_out.pushBack(core.allocator, .connectivity_check);
+                return core.connectivity_check_deadline;
+            }
+
+            return core.connectivity_check_deadline;
+        },
+        else => return std.math.maxInt(i64),
+    }
+}
+
+fn nextKeepAliveInterval(core: *Core, now: i64) !i64 {
+    switch (core.connection_state) {
+        .connected => {
+            if (now >= core.keep_alive_deadline) {
+                core.onComplete();
+                core.keep_alive_deadline = now + keep_alive_interval;
+                try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
+                try core.events_out.pushBack(core.allocator, .consent_freshness);
+            }
+
+            return core.keep_alive_deadline;
+        },
+        .completed, .disconnected => {
+            if (now >= core.keep_alive_deadline) {
+                core.keep_alive_deadline = now + keep_alive_interval;
+                try core.events_out.pushBack(core.allocator, .consent_freshness);
+            }
+
+            return core.keep_alive_deadline;
+        },
+        else => return std.math.maxInt(i64),
+    }
+}
+
+fn nextConnectionTimeout(core: *Core, now: i64) !i64 {
+    switch (core.connection_state) {
+        .checking => {
+            if (now >= core.failed_connection_deadline) {
+                core.connection_state = .failed;
+                try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
+                return std.math.maxInt(i64);
+            }
+
+            return core.failed_connection_deadline;
+        },
+        .connected, .completed => {
+            if (now >= core.disconnected_connection_deadline) {
+                core.connection_state = .disconnected;
+                core.failed_connection_deadline = now + @as(i64, core.failed_timeout);
+                try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
+                return core.failed_connection_deadline;
+            }
+
+            return core.disconnected_connection_deadline;
+        },
+        .disconnected => {
+            if (now >= core.failed_connection_deadline) {
+                core.connection_state = .failed;
+                try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
+                return std.math.maxInt(i64);
+            }
+
+            return core.failed_connection_deadline;
+        },
+        else => return std.math.maxInt(i64),
     }
 }
 
@@ -572,7 +679,7 @@ fn testNewCore(role: ice.Role) !Core {
         .username = "user",
         .password = "VOkJxbRl1RmTxUk/WvJxBt",
     }).dupe(testing.allocator);
-    return Core.init(testing.allocator, role, credentials, 0x1000000);
+    return Core.init(testing.allocator, .{ .role = role, .credentials = credentials, .tie_breaker = 0x1000000 });
 }
 
 fn testBuildRequest(req: Messages.StunRequest, peer_password: []const u8, buffer: []u8) !stun.Message {
@@ -887,7 +994,7 @@ test "handleInput: drops non-stun data from an unknown remote before connected" 
     const from = try IpAddress.parse("192.168.1.120", 2000);
     var resp_buffer: [64]u8 = undefined;
 
-    try core.handleInput(&base_addr, &from, "hello", &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, "hello"), &resp_buffer);
 
     try testing.expectEqual(null, core.pollEvent());
 }
@@ -904,7 +1011,7 @@ test "handleInput: forwards non-stun data from a known remote candidate pair" {
     try core.remote_candidates.append(testing.allocator, .initHost(from));
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .in_progress, .priority = 0 });
 
-    try core.handleInput(&base_addr, &from, "hello", &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, "hello"), &resp_buffer);
 
     const event = core.pollEvent() orelse return error.ExpectedEvent;
     switch (event) {
@@ -923,7 +1030,7 @@ test "handleInput: forwards non-stun data once connected regardless of sender" {
     const from = try IpAddress.parse("10.0.0.5", 4000);
     var resp_buffer: [64]u8 = undefined;
 
-    try core.handleInput(&base_addr, &from, "world", &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, "world"), &resp_buffer);
 
     const event = core.pollEvent() orelse return error.ExpectedEvent;
     switch (event) {
@@ -949,7 +1056,7 @@ test "handleInput: ignores stun messages once the connection is completed" {
         .username = core.credentials.username,
     }, core.credentials.password, &buffer);
 
-    try core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, msg.bytes), &resp_buffer);
 
     try testing.expectEqual(null, core.pollEvent());
 }
@@ -971,11 +1078,11 @@ test "handleInput: stun request produces a response event" {
         .username = core.credentials.username,
     }, core.credentials.password, &buffer);
 
-    try core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, msg.bytes), &resp_buffer);
 
     const event = core.pollEvent() orelse return error.ExpectedEvent;
     switch (event) {
-        .response => |resp| {
+        .message => |resp| {
             const resp_msg = try stun.Message.parse(resp.data);
             try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
         },
@@ -1001,7 +1108,7 @@ test "handleInput: role conflict switches role and reports no event" {
         .username = core.credentials.username,
     }, core.credentials.password, &buffer);
 
-    try testing.expectError(error.SwitchRole, core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer));
+    try testing.expectError(error.SwitchRole, core.handleInput(.init(&from, &base_addr, msg.bytes), &resp_buffer));
     try testing.expectEqual(null, core.pollEvent());
 }
 
@@ -1030,13 +1137,8 @@ test "handleInput: success response completes the pending request and marks the 
     var resp_buffer: [64]u8 = undefined;
     const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.password, &buffer);
 
-    try core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, msg.bytes), &resp_buffer);
 
-    const event = core.pollEvent() orelse return error.ExpectedEvent;
-    switch (event) {
-        .response => |resp| try testing.expectEqualSlices(u8, msg.bytes, resp.data),
-        else => return error.UnexpectedEvent,
-    }
     try testing.expectEqual(null, core.pollEvent());
 
     try testing.expectEqual(.succeeded, core.pairs.items[0].status);
@@ -1074,12 +1176,8 @@ test "handleInput: success response nominates the pair and transitions to connec
     var resp_buffer: [64]u8 = undefined;
     const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.password, &buffer);
 
-    try core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, msg.bytes), &resp_buffer);
 
-    switch (core.pollEvent() orelse return error.ExpectedResponseEvent) {
-        .response => {},
-        else => return error.UnexpectedEvent,
-    }
     switch (core.pollEvent() orelse return error.ExpectedNominatedEvent) {
         .nominated => {},
         else => return error.UnexpectedEvent,
