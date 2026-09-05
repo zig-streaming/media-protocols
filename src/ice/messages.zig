@@ -93,7 +93,7 @@ pub fn parseAndValidateStunResponse(msg: *const stun.Message, credentials: ice.C
 pub fn buildSuccessResponse(
     msg: *const stun.Message,
     password: []const u8,
-    from: IpAddress,
+    from: *const IpAddress,
     buffer: []u8,
 ) ![]const u8 {
     var w = stun.Writer.init(buffer, .{ .password = password });
@@ -102,7 +102,7 @@ pub fn buildSuccessResponse(
         .transaction_id = msg.header.transaction_id,
         .message_length = 0,
     });
-    try w.writeAttribute(.{ .xor_mapped_address = from });
+    try w.writeAttribute(.{ .xor_mapped_address = from.* });
     try w.writeAttribute(.{ .message_integrity = &.{} });
     try w.writeAttribute(.fingerprint);
     return w.final();

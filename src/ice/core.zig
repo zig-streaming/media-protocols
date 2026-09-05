@@ -7,12 +7,24 @@ const Messages = @import("messages.zig");
 const Core = @This();
 const Candidate = ice.Candidate;
 const IpAddress = std.Io.net.IpAddress;
+const Logger = std.log.scoped(.ice);
 
 const SelectedPair = struct {
     pair: CandidatePair,
     pair_index: usize,
     local: Candidate,
     remote: Candidate,
+};
+
+pub const Event = union(enum) {
+    connection_state: ice.ConnectionState,
+    nominated: void,
+    response: struct {
+        data: []const u8,
+        base: *const IpAddress,
+        dest: *const IpAddress,
+    },
+    data: []const u8,
 };
 
 /// The maximum number of binding requests sent on a pair before it is
@@ -38,6 +50,8 @@ pending_requests: std.ArrayList(PendingRequest) = .empty,
 selected_pair: ?SelectedPair = null,
 // This the final pair selected by this agent or the remote one.
 nominated_pair: ?SelectedPair = null,
+
+events_out: std.Deque(Event),
 
 const PendingRequest = struct {
     transaction_id: u96,
@@ -122,6 +136,7 @@ pub fn init(allocator: std.mem.Allocator, role: ice.Role, credentials: ice.Crede
         .role = role,
         .credentials = credentials,
         .tie_breaker = tie_breaker,
+        .events_out = .empty,
     };
 }
 
@@ -137,6 +152,7 @@ pub fn deinit(core: *Core) void {
         core.remote_credentials = null;
     }
 
+    core.events_out.deinit(core.allocator);
     core.connection_state = .closed;
 }
 
@@ -173,7 +189,7 @@ pub fn handleConsentFreshness(core: *Core, from: *const IpAddress, message: []co
                 core.role,
                 core.tie_breaker,
             );
-            return try Messages.buildSuccessResponse(&msg, core.credentials.password, from.*, buffer);
+            return try Messages.buildSuccessResponse(&msg, core.credentials.password, from, buffer);
         },
         else => {},
     }
@@ -238,6 +254,40 @@ pub fn beginConnectivityChecks(core: *Core) ?ConnectivityChecks {
     return .{ .core = core };
 }
 
+pub fn handleInput(core: *Core, base: *const IpAddress, sender: *const IpAddress, data: []const u8, buffer: []u8) !void {
+    if (!stun.isMessage(data)) {
+        try core.handleAppData(sender, data);
+        return;
+    }
+
+    switch (core.connection_state) {
+        .completed, .failed, .closed => return,
+        else => {},
+    }
+
+    const msg = try stun.Message.parse(data);
+
+    switch (msg.header.message_type.class()) {
+        .request => {
+            const resp = try core.handleRequest(&msg, base, sender, buffer);
+            if (core.detectNominatedPair() != null) try core.events_out.pushBack(core.allocator, .nominated);
+            try core.events_out.pushBack(core.allocator, .{ .response = .{ .data = resp, .base = base, .dest = sender } });
+        },
+        .success_response => {
+            try core.handleSuccessResponse(&msg, base.*, sender.*);
+            try core.events_out.pushBack(core.allocator, .{ .response = .{ .data = data, .base = base, .dest = sender } });
+            if (core.detectNominatedPair() != null) try core.events_out.pushBack(core.allocator, .nominated);
+        },
+        else => {},
+    }
+
+    if (core.markConnected()) try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
+}
+
+pub fn pollEvent(core: *Core) ?Event {
+    return core.events_out.popFront();
+}
+
 pub fn detectNominatedPair(core: *Core) ?CandidatePair {
     if (core.role == .controlling or core.nominated_pair != null) return null;
     for (core.pairs.items, 0..) |pair, idx| if (pair.nominated) {
@@ -297,25 +347,53 @@ pub fn buildBindingRequest(core: *Core, tx_id: u96, use_candidate: bool, buffer:
     return w.final();
 }
 
-pub fn handleRequest(core: *Core, msg: *const stun.Message, base_addr: IpAddress, from: IpAddress, buffer: []u8) ![]const u8 {
+pub fn toggleRole(core: *Core, tie_breaker: u64) void {
+    switch (core.role) {
+        .controlling => core.role = .controlled,
+        .controlled => core.role = .controlling,
+    }
+    core.tie_breaker = tie_breaker;
+
+    for (core.pairs.items) |*pair| {
+        const local = core.getPairLocal(pair);
+        const remote = core.getPairRemote(pair);
+        pair.priority = calculatePairPriority(local.priority, remote.priority, core.role);
+    }
+}
+
+fn handleAppData(core: *Core, sender: *const IpAddress, data: []const u8) !void {
+    switch (core.connection_state) {
+        .connected, .completed => try core.events_out.pushBack(core.allocator, .{ .data = data }),
+        else => {
+            for (core.pairs.items) |*candidate_pair| {
+                const remote = &core.remote_candidates.items[candidate_pair.remote];
+                if (remote.address.eql(sender)) try core.events_out.pushBack(core.allocator, .{ .data = data });
+            } else {
+                Logger.warn("Drop non stun message from unknown remote candidate: {f}", .{sender});
+            }
+        },
+    }
+}
+
+fn handleRequest(core: *Core, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress, buffer: []u8) ![]const u8 {
     const stun_req = Messages.parseAndValidateStunRequest(msg, core.credentials, core.role, core.tie_breaker) catch |err| switch (err) {
         error.RoleConflict => return try Messages.buildRoleConflictErrorMessage(msg.header.transaction_id, core.credentials.password, buffer),
         else => |e| return e,
     };
 
-    if (core.findCandidatePair(&base_addr, &from)) |candidate_pair| {
+    if (core.findCandidatePair(base_addr, from)) |candidate_pair| {
         switch (candidate_pair.status) {
             .succeeded => candidate_pair.nominated |= stun_req.use_candidate,
             else => candidate_pair.nominate_on_binding |= stun_req.use_candidate,
         }
     } else {
-        const local_idx = core.findLocalCandidate(&base_addr, &base_addr) orelse return error.NoLocalCandidate;
+        const local_idx = core.findLocalCandidate(base_addr, base_addr) orelse return error.NoLocalCandidate;
         const local_candidate = core.candidates.items[local_idx];
 
-        const remote_idx: u32 = core.findRemoteCandidate(&from) orelse blk: {
+        const remote_idx: u32 = core.findRemoteCandidate(from) orelse blk: {
             const candidate = Candidate{
-                .base = from,
-                .address = from,
+                .base = from.*,
+                .address = from.*,
                 .candidate_type = .prflx,
                 .priority = stun_req.priority,
             };
@@ -335,9 +413,7 @@ pub fn handleRequest(core: *Core, msg: *const stun.Message, base_addr: IpAddress
     return try Messages.buildSuccessResponse(msg, core.credentials.password, from, buffer);
 }
 
-pub fn handleSuccessResponse(core: *Core, msg: *const stun.Message, base_addr: IpAddress, from: IpAddress) !void {
-    // Logger.debug("Handle success response on {f} from {f}", .{ base_addr, from });
-
+fn handleSuccessResponse(core: *Core, msg: *const stun.Message, base_addr: IpAddress, from: IpAddress) !void {
     const pending_request = blk: {
         const tx_id = msg.header.transaction_id;
         for (core.pending_requests.items, 0..) |pr, i| {
@@ -382,20 +458,6 @@ pub fn handleSuccessResponse(core: *Core, msg: *const stun.Message, base_addr: I
             .priority = calculatePairPriority(local_candidate.priority, remote_candidate.priority, core.role),
             .status = .succeeded,
         });
-    }
-}
-
-pub fn toggleRole(core: *Core, tie_breaker: u64) void {
-    switch (core.role) {
-        .controlling => core.role = .controlled,
-        .controlled => core.role = .controlling,
-    }
-    core.tie_breaker = tie_breaker;
-
-    for (core.pairs.items) |*pair| {
-        const local = core.getPairLocal(pair);
-        const remote = core.getPairRemote(pair);
-        pair.priority = calculatePairPriority(local.priority, remote.priority, core.role);
     }
 }
 
@@ -531,6 +593,20 @@ fn testBuildRequest(req: Messages.StunRequest, peer_password: []const u8, buffer
     return try stun.Message.parse(w.final());
 }
 
+fn testBuildResponse(tx_id: u96, addr: IpAddress, password: []const u8, buffer: []u8) !stun.Message {
+    var w = stun.Writer.init(buffer, .{ .password = password });
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.success_response, .binding),
+        .transaction_id = tx_id,
+        .message_length = 0,
+    });
+    try w.writeAttribute(.{ .xor_mapped_address = addr });
+    try w.writeAttribute(.{ .message_integrity = &.{} });
+    try w.writeAttribute(.fingerprint);
+
+    return try stun.Message.parse(w.final());
+}
+
 test "handleRequest: generate success response" {
     var core = try testNewCore(.controlled);
     defer core.deinit();
@@ -549,7 +625,7 @@ test "handleRequest: generate success response" {
         .username = core.credentials.username,
     }, core.credentials.password, &buffer);
 
-    const resp = try core.handleRequest(&msg, base_addr, from, &resp_buffer);
+    const resp = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
     const resp_msg = try stun.Message.parse(resp);
 
     try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
@@ -586,7 +662,7 @@ test "handleRequest: create peer reflexive candidate" {
         .username = core.credentials.username,
     }, core.credentials.password, &buffer);
 
-    _ = try core.handleRequest(&msg, base_addr, from, &resp_buffer);
+    _ = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
 
     try testing.expectEqual(1, core.pairs.items.len);
 
@@ -596,7 +672,7 @@ test "handleRequest: create peer reflexive candidate" {
     try testing.expectEqual(remote.priority, 0x9090);
 
     // Send request again
-    _ = try core.handleRequest(&msg, base_addr, from, &resp_buffer);
+    _ = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
     try testing.expectEqual(1, core.pairs.items.len); // no new peer is created
 }
 
@@ -626,14 +702,14 @@ test "handleRequest: nominate peer" {
         .use_candidate = true,
     }, core.credentials.password, &buffer);
 
-    _ = try core.handleRequest(&msg, base_addr, from, &resp_buffer);
+    _ = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
 
     const candidate_pair = &core.pairs.items[0];
     try testing.expect(candidate_pair.nominate_on_binding);
     try testing.expect(!candidate_pair.nominated);
 
     candidate_pair.status = .succeeded;
-    _ = try core.handleRequest(&msg, base_addr, from, &resp_buffer);
+    _ = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
     try testing.expect(candidate_pair.nominated);
 }
 
@@ -654,7 +730,7 @@ test "handleRequest: role conflict" {
             .username = core.credentials.username,
         }, core.credentials.password, &buffer);
 
-        const resp = try core.handleRequest(&msg, base_addr, from, &resp_buffer);
+        const resp = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
         const resp_msg = try stun.Message.parse(resp);
 
         try testing.expectEqual(.error_response, resp_msg.header.message_type.class());
@@ -675,7 +751,7 @@ test "handleRequest: role conflict" {
             .username = core.credentials.username,
         }, core.credentials.password, &buffer);
 
-        try testing.expectError(error.SwitchRole, core.handleRequest(&msg, base_addr, from, &resp_buffer));
+        try testing.expectError(error.SwitchRole, core.handleRequest(&msg, &base_addr, &from, &resp_buffer));
     }
 }
 
@@ -801,4 +877,220 @@ test "toggleRole: flips role, tie breaker and pair priorities" {
     try testing.expectEqual(.controlling, core.role);
     try testing.expectEqual(0x1000000, core.tie_breaker);
     try testing.expectEqual(controlling_priority, core.pairs.items[0].priority);
+}
+
+test "handleInput: drops non-stun data from an unknown remote before connected" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+    var resp_buffer: [64]u8 = undefined;
+
+    try core.handleInput(&base_addr, &from, "hello", &resp_buffer);
+
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleInput: forwards non-stun data from a known remote candidate pair" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+    var resp_buffer: [64]u8 = undefined;
+
+    try core.candidates.append(testing.allocator, .initHost(base_addr));
+    try core.remote_candidates.append(testing.allocator, .initHost(from));
+    try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .in_progress, .priority = 0 });
+
+    try core.handleInput(&base_addr, &from, "hello", &resp_buffer);
+
+    const event = core.pollEvent() orelse return error.ExpectedEvent;
+    switch (event) {
+        .data => |data| try testing.expectEqualStrings("hello", data),
+        else => return error.UnexpectedEvent,
+    }
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleInput: forwards non-stun data once connected regardless of sender" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+    core.connection_state = .connected;
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("10.0.0.5", 4000);
+    var resp_buffer: [64]u8 = undefined;
+
+    try core.handleInput(&base_addr, &from, "world", &resp_buffer);
+
+    const event = core.pollEvent() orelse return error.ExpectedEvent;
+    switch (event) {
+        .data => |data| try testing.expectEqualStrings("world", data),
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "handleInput: ignores stun messages once the connection is completed" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+    core.connection_state = .completed;
+
+    var buffer: [1024]u8 = undefined;
+    var resp_buffer: [1024]u8 = undefined;
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+
+    const msg = try testBuildRequest(.{
+        .ice_controlling = 0x10000,
+        .priority = 0x9090,
+        .username = core.credentials.username,
+    }, core.credentials.password, &buffer);
+
+    try core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer);
+
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleInput: stun request produces a response event" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var resp_buffer: [1024]u8 = undefined;
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+    _ = try core.addHostCandidate(base_addr);
+
+    const msg = try testBuildRequest(.{
+        .ice_controlling = 0x10000,
+        .priority = 0x9090,
+        .username = core.credentials.username,
+    }, core.credentials.password, &buffer);
+
+    try core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer);
+
+    const event = core.pollEvent() orelse return error.ExpectedEvent;
+    switch (event) {
+        .response => |resp| {
+            const resp_msg = try stun.Message.parse(resp.data);
+            try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
+        },
+        else => return error.UnexpectedEvent,
+    }
+    try testing.expectEqual(null, core.pollEvent());
+    try testing.expectEqual(1, core.pairs.items.len);
+}
+
+test "handleInput: role conflict switches role and reports no event" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var resp_buffer: [1024]u8 = undefined;
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+
+    const msg = try testBuildRequest(.{
+        .ice_controlled = 0,
+        .priority = 0x9090,
+        .username = core.credentials.username,
+    }, core.credentials.password, &buffer);
+
+    try testing.expectError(error.SwitchRole, core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer));
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleInput: success response completes the pending request and marks the pair succeeded" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.remote_credentials = try (ice.Credentials{
+        .username = "ruser",
+        .password = "peer-password-0123456789",
+    }).dupe(testing.allocator);
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+
+    try core.candidates.append(testing.allocator, .initHost(base_addr));
+    try core.remote_candidates.append(testing.allocator, .initHost(from));
+    try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .in_progress, .priority = 0 });
+    try core.pending_requests.append(testing.allocator, .{
+        .transaction_id = 0x2,
+        .source = base_addr,
+        .target = from,
+    });
+
+    var buffer: [1024]u8 = undefined;
+    var resp_buffer: [64]u8 = undefined;
+    const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.password, &buffer);
+
+    try core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer);
+
+    const event = core.pollEvent() orelse return error.ExpectedEvent;
+    switch (event) {
+        .response => |resp| try testing.expectEqualSlices(u8, msg.bytes, resp.data),
+        else => return error.UnexpectedEvent,
+    }
+    try testing.expectEqual(null, core.pollEvent());
+
+    try testing.expectEqual(.succeeded, core.pairs.items[0].status);
+    try testing.expectEqual(0, core.pending_requests.items.len);
+}
+
+test "handleInput: success response nominates the pair and transitions to connected" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    core.remote_credentials = try (ice.Credentials{
+        .username = "ruser",
+        .password = "peer-password-0123456789",
+    }).dupe(testing.allocator);
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+
+    try core.candidates.append(testing.allocator, .initHost(base_addr));
+    try core.remote_candidates.append(testing.allocator, .initHost(from));
+    try core.pairs.append(testing.allocator, .{
+        .local = 0,
+        .remote = 0,
+        .status = .in_progress,
+        .priority = 0,
+        .nominate_on_binding = true,
+    });
+    try core.pending_requests.append(testing.allocator, .{
+        .transaction_id = 0x2,
+        .source = base_addr,
+        .target = from,
+    });
+
+    var buffer: [1024]u8 = undefined;
+    var resp_buffer: [64]u8 = undefined;
+    const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.password, &buffer);
+
+    try core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer);
+
+    switch (core.pollEvent() orelse return error.ExpectedResponseEvent) {
+        .response => {},
+        else => return error.UnexpectedEvent,
+    }
+    switch (core.pollEvent() orelse return error.ExpectedNominatedEvent) {
+        .nominated => {},
+        else => return error.UnexpectedEvent,
+    }
+    switch (core.pollEvent() orelse return error.ExpectedConnectionStateEvent) {
+        .connection_state => |state| try testing.expectEqual(.connected, state),
+        else => return error.UnexpectedEvent,
+    }
+    try testing.expectEqual(null, core.pollEvent());
+
+    try testing.expectEqual(.connected, core.connection_state);
+    try testing.expect(core.pairs.items[0].nominated);
+    try testing.expect(core.nominated_pair != null);
 }
