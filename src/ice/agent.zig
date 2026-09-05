@@ -378,18 +378,31 @@ fn poll(agent: *Agent) !void {
         .connectivity_check => agent.batchSendConnectivityCheck() catch |err| logError("connectivity check failed due to {}", .{err}),
         .message => |message| {
             defer agent.destroyPacket(message.incoming_message.data);
-            const maybe_event = agent.handleConnectivityCheckMessage(message) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                error.SwitchRole => {
-                    agent.core.toggleRole(randomNumber(u64, io));
-                    continue;
-                },
-                else => continue,
-            };
 
-            if (maybe_event) |ev| switch (ev) {
+            const buffer = try agent.createPacket();
+            defer agent.destroyPacket(buffer);
+
+            {
+                agent.mutex.lockUncancelable(io);
+                defer agent.mutex.unlock(io);
+                agent.core.handleInput(&message.channel.address(), &message.incoming_message.from, message.incoming_message.data, buffer) catch |err| switch (err) {
+                    error.SwitchRole => {
+                        agent.core.toggleRole(randomNumber(u64, io));
+                        continue;
+                    },
+                    else => continue,
+                };
+            }
+
+            while (agent.core.pollEvent()) |core_event| switch (core_event) {
+                .response => |resp| try message.channel.send(agent, &message.incoming_message.from, resp.data),
                 .data => |data| try agent.on_data(agent.userdata, agent, data),
-                else => try agent.on_event(agent.userdata, agent, ev),
+                .nominated => agent.nominated_channel = message.channel,
+                .connection_state => {
+                    try agent.group.concurrent(io, markConnectionCompleted, .{ agent, .fromSeconds(3) });
+                    try agent.group.concurrent(io, keepAlive, .{ agent, keep_alive_interval });
+                    try agent.on_event(agent.userdata, agent, .{ .connection_state = agent.core.connection_state });
+                },
             };
         },
         .connection_state => |state| {
@@ -847,67 +860,6 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
             agent.core.pairs.items[send.pair].status = .failed;
         };
     }
-}
-
-fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
-    const data = message.incoming_message.data;
-    const sender = message.incoming_message.from;
-
-    if (stun.isMessage(data)) {
-        switch (agent.core.connection_state) {
-            .completed, .failed, .closed => return null, // sockets are closed
-            else => {},
-        }
-
-        const msg = try stun.Message.parse(data);
-
-        switch (msg.header.message_type.class()) {
-            .request => {
-                const buffer = try agent.createPacket();
-                defer agent.destroyPacket(buffer);
-
-                const resp = res: {
-                    const r = try agent.core.handleRequest(&msg, message.channel.address(), sender, buffer);
-                    if (agent.core.detectNominatedPair() != null) agent.nominated_channel = message.channel;
-
-                    break :res r;
-                };
-
-                try message.channel.send(agent, &sender, resp);
-            },
-            .success_response => {
-                {
-                    agent.mutex.lockUncancelable(agent.io);
-                    defer agent.mutex.unlock(agent.io);
-                    try agent.core.handleSuccessResponse(&msg, message.channel.address(), sender);
-                }
-                if (agent.core.detectNominatedPair() != null) agent.nominated_channel = message.channel;
-            },
-            else => {},
-        }
-
-        if (agent.core.markConnected()) {
-            const io = agent.io;
-
-            try agent.group.concurrent(io, markConnectionCompleted, .{ agent, .fromSeconds(3) });
-            try agent.group.concurrent(io, keepAlive, .{ agent, keep_alive_interval });
-            return .{ .connection_state = agent.core.connection_state };
-        }
-    } else {
-        switch (agent.core.connection_state) {
-            .connected, .completed => return .{ .data = data },
-            else => {
-                for (agent.core.pairs.items) |*candidate_pair| {
-                    const remote = &agent.core.remote_candidates.items[candidate_pair.remote];
-                    if (remote.address.eql(&sender)) return .{ .data = data };
-                } else {
-                    Logger.warn("Drop non stun message from unknown remote candidate: {f}", .{sender});
-                }
-            },
-        }
-    }
-
-    return null;
 }
 
 fn handleConsentFreshness(agent: *Agent, from: *const IpAddress, data: []const u8) !void {
