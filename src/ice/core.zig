@@ -172,10 +172,14 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Core {
 }
 
 pub fn deinit(core: *Core) void {
-    core.candidates.deinit(core.allocator);
-    core.remote_candidates.deinit(core.allocator);
+    core.close();
+}
+
+pub fn close(core: *Core) void {
     core.pairs.deinit(core.allocator);
     core.pending_requests.deinit(core.allocator);
+    core.candidates.deinit(core.allocator);
+    core.remote_candidates.deinit(core.allocator);
 
     core.credentials.deinit(core.allocator);
     if (core.remote_credentials) |*remote| {

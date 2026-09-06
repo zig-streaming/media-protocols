@@ -111,7 +111,7 @@ const Message = struct {
 
 const InnerEvent = union(enum) {
     message: Message,
-    connectivity_check: void,
+    poll: void,
     candidate: ?union(enum) {
         host: Socket,
         srflx: struct { Socket, IpAddress },
@@ -265,7 +265,7 @@ pub fn gatherCandidates(agent: *Agent) !void {
 
 pub fn sendData(agent: *Agent, data: []const u8) !void {
     switch (agent.core.connection_state) {
-        .connected, .completed => {
+        .connected, .completed, .disconnected => {
             @branchHint(.likely);
             const dest = &agent.core.nominated_pair.?.remote;
             try agent.nominated_channel.?.send(agent, &dest.address, data);
@@ -367,7 +367,7 @@ fn poll(agent: *Agent) !void {
             } else try agent.on_event(agent.userdata, agent, .{ .candidate = null });
         },
         .remote_candidate => |candidate| try agent.core.addRemoteCandidate(candidate),
-        .connectivity_check => agent.batchSendConnectivityCheck() catch |err| logError("connectivity check failed due to {}", .{err}),
+        .poll => try agent.drainCoreEvents(),
         .message => |message| {
             defer agent.destroyPacket(message.incoming_message.data);
 
@@ -391,18 +391,7 @@ fn poll(agent: *Agent) !void {
                     else => continue,
                 };
             }
-
-            while (blk: {
-                agent.mutex.lockUncancelable(io);
-                defer agent.mutex.unlock(io);
-                break :blk agent.core.pollEvent();
-            }) |core_event| switch (core_event) {
-                .message => |resp| try message.channel.send(agent, &message.incoming_message.from, resp.data),
-                .data => |data| try agent.on_data(agent.userdata, agent, data),
-                .nominated => agent.nominated_channel = message.channel,
-                .connection_state => try agent.on_event(agent.userdata, agent, .{ .connection_state = agent.core.connection_state }),
-                else => {},
-            };
+            try agent.drainCoreEvents();
         },
         .connection_state => |state| {
             if (state == .failed) agent.failConnection();
@@ -416,7 +405,6 @@ fn poll(agent: *Agent) !void {
         .role => |r| if (agent.core.role != r) agent.core.toggleRole(agent.core.tie_breaker),
         .close => {
             agent.closeConnection();
-            agent.setConnectionState(.closed);
             try agent.on_event(agent.userdata, agent, .{ .connection_state = .closed });
             break;
         },
@@ -425,6 +413,7 @@ fn poll(agent: *Agent) !void {
 
 fn closeConnection(agent: *Agent) void {
     agent.group.cancel(agent.io);
+    agent.core.close();
     agent.failConnection();
 
     agent.core.allocator.free(agent.queue_buffer);
@@ -694,10 +683,6 @@ fn pruneNonNominatedRelayClients(agent: *Agent) void {
     }
 }
 
-fn setConnectionState(agent: *Agent, new_state: ice.ConnectionState) void {
-    agent.core.connection_state = new_state;
-}
-
 fn timeoutHandler(agent: *Agent) !void {
     const io = agent.io;
     while (true) {
@@ -707,18 +692,46 @@ fn timeoutHandler(agent: *Agent) !void {
             defer agent.mutex.unlock(io);
             break :blk agent.core.handleTimeout(now) catch return;
         };
-        while (blk: {
-            agent.mutex.lockUncancelable(io);
-            defer agent.mutex.unlock(io);
-            break :blk agent.core.pollEvent();
-        }) |event| switch (event) {
-            .connectivity_check => try agent.putInQueue(.connectivity_check),
-            .consent_freshness => agent.sendConsentFreshness() catch return,
-            .connection_state => |state| try agent.putInQueue(.{ .connection_state = state }),
-            else => {},
-        };
+        try agent.putInQueue(.poll);
         try io.sleep(.fromMilliseconds(next_deadline - now), .awake);
     }
+}
+
+fn drainCoreEvents(agent: *Agent) !void {
+    const io = agent.io;
+    while (blk: {
+        agent.mutex.lockUncancelable(io);
+        defer agent.mutex.unlock(io);
+        break :blk agent.core.pollEvent();
+    }) |event| switch (event) {
+        .message => |resp| {
+            const channel: Channel = if (agent.findRelayClient(resp.from)) |client|
+                .{ .relay = client }
+            else if (agent.findSocket(resp.from)) |socket|
+                .{ .socket = socket.* }
+            else
+                continue;
+            channel.send(agent, resp.to, resp.data) catch |err|
+                logError("failed to send response: {}", .{err});
+        },
+        .data => |data| try agent.on_data(agent.userdata, agent, data),
+        .nominated => {
+            const local = &agent.core.nominated_pair.?.local.base;
+            if (agent.findRelayClient(local)) |client|
+                agent.nominated_channel = .{ .relay = client }
+            else if (agent.findSocket(local)) |socket|
+                agent.nominated_channel = .{ .socket = socket.* };
+        },
+        .connection_state => |state| {
+            if (state == .failed) agent.failConnection();
+            if (state == .completed) agent.pruneNonNominatedRelayClients();
+            try agent.on_event(agent.userdata, agent, .{ .connection_state = state });
+        },
+        .connectivity_check => agent.batchSendConnectivityCheck() catch |err|
+            logError("connectivity check failed due to {}", .{err}),
+        .consent_freshness => agent.sendConsentFreshness() catch |err|
+            logError("failed to send consent freshness: {}", .{err}),
+    };
 }
 
 fn receive(agent: *Agent, socket: Socket) !void {
