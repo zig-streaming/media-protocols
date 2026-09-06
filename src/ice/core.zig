@@ -16,20 +16,31 @@ const SelectedPair = struct {
     remote: Candidate,
 };
 
+pub const Message = struct {
+    from: *const IpAddress,
+    to: *const IpAddress,
+    data: []const u8,
+    timestamp: i64 = 0,
+
+    pub fn init(from: *const IpAddress, to: *const IpAddress, data: []const u8) Message {
+        return .{ .from = from, .to = to, .data = data };
+    }
+};
+
 pub const Event = union(enum) {
     connection_state: ice.ConnectionState,
     nominated: void,
-    response: struct {
-        data: []const u8,
-        base: *const IpAddress,
-        dest: *const IpAddress,
-    },
+    message: Message,
     data: []const u8,
+    connectivity_check: void,
+    consent_freshness: void,
 };
 
 /// The maximum number of binding requests sent on a pair before it is
 /// considered failed.
 pub const max_binding_requests: usize = 7;
+pub const connectivity_check_interval: i64 = 200;
+pub const keep_alive_interval: i64 = 4_000;
 
 allocator: std.mem.Allocator,
 connection_state: ice.ConnectionState = .new,
@@ -51,6 +62,12 @@ selected_pair: ?SelectedPair = null,
 // This the final pair selected by this agent or the remote one.
 nominated_pair: ?SelectedPair = null,
 
+connectivity_check_deadline: i64,
+disconnected_connection_deadline: i64,
+failed_connection_deadline: i64,
+keep_alive_deadline: i64,
+failed_timeout: u32,
+disconnected_timeout: u32,
 events_out: std.Deque(Event),
 
 const PendingRequest = struct {
@@ -130,40 +147,57 @@ pub const ConnectivityChecks = struct {
     }
 };
 
-pub fn init(allocator: std.mem.Allocator, role: ice.Role, credentials: ice.Credentials, tie_breaker: u64) Core {
+pub const Config = struct {
+    role: ice.Role,
+    credentials: ice.Credentials,
+    tie_breaker: u64,
+    failed_timeout: u32 = 25000,
+    disconnected_timeout: u32 = 5000,
+};
+
+pub fn init(allocator: std.mem.Allocator, config: Config) Core {
     return .{
         .allocator = allocator,
-        .role = role,
-        .credentials = credentials,
-        .tie_breaker = tie_breaker,
+        .role = config.role,
+        .credentials = config.credentials,
+        .tie_breaker = config.tie_breaker,
+        .connectivity_check_deadline = 0,
+        .keep_alive_deadline = 0,
+        .failed_connection_deadline = 0,
+        .disconnected_connection_deadline = 0,
+        .failed_timeout = config.failed_timeout,
+        .disconnected_timeout = config.disconnected_timeout,
         .events_out = .empty,
     };
 }
 
 pub fn deinit(core: *Core) void {
-    core.candidates.deinit(core.allocator);
-    core.remote_candidates.deinit(core.allocator);
+    core.close();
     core.pairs.deinit(core.allocator);
     core.pending_requests.deinit(core.allocator);
+    core.candidates.deinit(core.allocator);
+    core.remote_candidates.deinit(core.allocator);
+    core.events_out.deinit(core.allocator);
+}
+
+pub fn close(core: *Core) void {
+    core.connection_state = .closed;
+
+    core.pairs.clearAndFree(core.allocator);
+    core.pending_requests.clearAndFree(core.allocator);
+    core.candidates.clearAndFree(core.allocator);
+    core.remote_candidates.clearAndFree(core.allocator);
 
     core.credentials.deinit(core.allocator);
     if (core.remote_credentials) |*remote| {
         remote.deinit(core.allocator);
         core.remote_credentials = null;
     }
-
-    core.events_out.deinit(core.allocator);
-    core.connection_state = .closed;
 }
 
-/// Release the connectivity-check bookkeeping once the connection is complete.
-///
-/// The nominated pair is kept (it lives in its own field); the checklist,
-/// remote candidates and pending requests are no longer needed.
-pub fn onComplete(core: *Core) void {
-    core.remote_candidates.clearAndFree(core.allocator);
-    core.pairs.clearAndFree(core.allocator);
-    core.pending_requests.clearAndFree(core.allocator);
+pub fn setRemoteCredentials(core: *Core, credentials: ice.Credentials) !void {
+    if (core.remote_credentials) |*remote| remote.deinit(core.allocator);
+    core.remote_credentials = try credentials.dupe(core.allocator);
 }
 
 pub fn addHostCandidate(core: *Core, addr: std.Io.net.IpAddress) !?Candidate {
@@ -254,9 +288,16 @@ pub fn beginConnectivityChecks(core: *Core) ?ConnectivityChecks {
     return .{ .core = core };
 }
 
-pub fn handleInput(core: *Core, base: *const IpAddress, sender: *const IpAddress, data: []const u8, buffer: []u8) !void {
-    if (!stun.isMessage(data)) {
-        try core.handleAppData(sender, data);
+pub fn handleTimeout(core: *Core, now: i64) std.mem.Allocator.Error!i64 {
+    const ck_deadline = try core.nextConnectivityCheckInterval(now);
+    const ka_deadline = try core.nextKeepAliveInterval(now);
+    const ct_deadline = try core.nextConnectionTimeout(now);
+    return @min(@min(ck_deadline, ka_deadline), ct_deadline);
+}
+
+pub fn handleInput(core: *Core, message: Message, buffer: []u8) !void {
+    if (!stun.isMessage(message.data)) {
+        try core.handleAppData(message.from, message.data);
         return;
     }
 
@@ -265,23 +306,22 @@ pub fn handleInput(core: *Core, base: *const IpAddress, sender: *const IpAddress
         else => {},
     }
 
-    const msg = try stun.Message.parse(data);
+    const msg = try stun.Message.parse(message.data);
 
     switch (msg.header.message_type.class()) {
         .request => {
-            const resp = try core.handleRequest(&msg, base, sender, buffer);
+            const resp = try core.handleRequest(&msg, message.to, message.from, buffer);
             if (core.detectNominatedPair() != null) try core.events_out.pushBack(core.allocator, .nominated);
-            try core.events_out.pushBack(core.allocator, .{ .response = .{ .data = resp, .base = base, .dest = sender } });
+            try core.events_out.pushBack(core.allocator, .{ .message = .init(message.to, message.from, resp) });
         },
         .success_response => {
-            try core.handleSuccessResponse(&msg, base.*, sender.*);
-            try core.events_out.pushBack(core.allocator, .{ .response = .{ .data = data, .base = base, .dest = sender } });
+            try core.handleSuccessResponse(&msg, message.to.*, message.from.*);
             if (core.detectNominatedPair() != null) try core.events_out.pushBack(core.allocator, .nominated);
         },
         else => {},
     }
 
-    if (core.markConnected()) try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
+    if (core.markConnected(message.timestamp)) try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
 }
 
 pub fn pollEvent(core: *Core) ?Event {
@@ -302,26 +342,14 @@ pub fn detectNominatedPair(core: *Core) ?CandidatePair {
     return null;
 }
 
-pub fn markConnected(core: *Core) bool {
+pub fn markConnected(core: *Core, now: i64) bool {
     if (core.nominated_pair != null and core.connection_state != .connected) {
         core.connection_state = .connected;
+        core.keep_alive_deadline = now + keep_alive_interval;
+        core.disconnected_connection_deadline = now + core.disconnected_timeout;
         return true;
     }
     return false;
-}
-
-pub fn onConsentTimeout(core: *Core) ?ice.ConnectionState {
-    switch (core.connection_state) {
-        .connected, .completed => {
-            core.connection_state = .disconnected;
-            return .disconnected;
-        },
-        .disconnected => {
-            core.connection_state = .failed;
-            return .failed;
-        },
-        else => return null,
-    }
 }
 
 pub fn buildBindingRequest(core: *Core, tx_id: u96, use_candidate: bool, buffer: []u8) ![]const u8 {
@@ -358,6 +386,93 @@ pub fn toggleRole(core: *Core, tie_breaker: u64) void {
         const local = core.getPairLocal(pair);
         const remote = core.getPairRemote(pair);
         pair.priority = calculatePairPriority(local.priority, remote.priority, core.role);
+    }
+}
+
+fn onComplete(core: *Core) void {
+    core.connection_state = .completed;
+    core.remote_candidates.clearAndFree(core.allocator);
+    core.pairs.clearAndFree(core.allocator);
+    core.pending_requests.clearAndFree(core.allocator);
+}
+
+fn nextConnectivityCheckInterval(core: *Core, now: i64) !i64 {
+    switch (core.connection_state) {
+        .new => {
+            core.connection_state = .checking;
+            core.connectivity_check_deadline = now + connectivity_check_interval;
+            core.failed_connection_deadline = now + @as(i64, core.failed_timeout);
+            try core.events_out.pushBack(core.allocator, .connectivity_check);
+            return core.connectivity_check_deadline;
+        },
+        .checking, .connected => {
+            if (now >= core.connectivity_check_deadline) {
+                core.connectivity_check_deadline = now + connectivity_check_interval;
+                try core.events_out.pushBack(core.allocator, .connectivity_check);
+                return core.connectivity_check_deadline;
+            }
+
+            return core.connectivity_check_deadline;
+        },
+        else => return std.math.maxInt(i64),
+    }
+}
+
+fn nextKeepAliveInterval(core: *Core, now: i64) !i64 {
+    switch (core.connection_state) {
+        .connected => {
+            if (now >= core.keep_alive_deadline) {
+                core.onComplete();
+                core.keep_alive_deadline = now + keep_alive_interval;
+                try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
+                try core.events_out.pushBack(core.allocator, .consent_freshness);
+            }
+
+            return core.keep_alive_deadline;
+        },
+        .completed, .disconnected => {
+            if (now >= core.keep_alive_deadline) {
+                core.keep_alive_deadline = now + keep_alive_interval;
+                try core.events_out.pushBack(core.allocator, .consent_freshness);
+            }
+
+            return core.keep_alive_deadline;
+        },
+        else => return std.math.maxInt(i64),
+    }
+}
+
+fn nextConnectionTimeout(core: *Core, now: i64) !i64 {
+    switch (core.connection_state) {
+        .checking => {
+            if (now >= core.failed_connection_deadline) {
+                core.connection_state = .failed;
+                try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
+                return std.math.maxInt(i64);
+            }
+
+            return core.failed_connection_deadline;
+        },
+        .connected, .completed => {
+            if (now >= core.disconnected_connection_deadline) {
+                core.connection_state = .disconnected;
+                core.failed_connection_deadline = now + @as(i64, core.failed_timeout);
+                try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
+                return core.failed_connection_deadline;
+            }
+
+            return core.disconnected_connection_deadline;
+        },
+        .disconnected => {
+            if (now >= core.failed_connection_deadline) {
+                core.connection_state = .failed;
+                try core.events_out.pushBack(core.allocator, .{ .connection_state = core.connection_state });
+                return std.math.maxInt(i64);
+            }
+
+            return core.failed_connection_deadline;
+        },
+        else => return std.math.maxInt(i64),
     }
 }
 
@@ -572,7 +687,7 @@ fn testNewCore(role: ice.Role) !Core {
         .username = "user",
         .password = "VOkJxbRl1RmTxUk/WvJxBt",
     }).dupe(testing.allocator);
-    return Core.init(testing.allocator, role, credentials, 0x1000000);
+    return Core.init(testing.allocator, .{ .role = role, .credentials = credentials, .tie_breaker = 0x1000000 });
 }
 
 fn testBuildRequest(req: Messages.StunRequest, peer_password: []const u8, buffer: []u8) !stun.Message {
@@ -605,6 +720,18 @@ fn testBuildResponse(tx_id: u96, addr: IpAddress, password: []const u8, buffer: 
     try w.writeAttribute(.fingerprint);
 
     return try stun.Message.parse(w.final());
+}
+
+fn expectEvent(core: *Core, tag: std.meta.Tag(Event)) !void {
+    const event = core.pollEvent() orelse return error.ExpectedEvent;
+    if (std.meta.activeTag(event) != tag) return error.UnexpectedEvent;
+}
+
+fn expectConnectionStateEvent(core: *Core, state: ice.ConnectionState) !void {
+    switch (core.pollEvent() orelse return error.ExpectedEvent) {
+        .connection_state => |s| try testing.expectEqual(state, s),
+        else => return error.UnexpectedEvent,
+    }
 }
 
 test "handleRequest: generate success response" {
@@ -887,7 +1014,7 @@ test "handleInput: drops non-stun data from an unknown remote before connected" 
     const from = try IpAddress.parse("192.168.1.120", 2000);
     var resp_buffer: [64]u8 = undefined;
 
-    try core.handleInput(&base_addr, &from, "hello", &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, "hello"), &resp_buffer);
 
     try testing.expectEqual(null, core.pollEvent());
 }
@@ -904,7 +1031,7 @@ test "handleInput: forwards non-stun data from a known remote candidate pair" {
     try core.remote_candidates.append(testing.allocator, .initHost(from));
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .in_progress, .priority = 0 });
 
-    try core.handleInput(&base_addr, &from, "hello", &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, "hello"), &resp_buffer);
 
     const event = core.pollEvent() orelse return error.ExpectedEvent;
     switch (event) {
@@ -923,7 +1050,7 @@ test "handleInput: forwards non-stun data once connected regardless of sender" {
     const from = try IpAddress.parse("10.0.0.5", 4000);
     var resp_buffer: [64]u8 = undefined;
 
-    try core.handleInput(&base_addr, &from, "world", &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, "world"), &resp_buffer);
 
     const event = core.pollEvent() orelse return error.ExpectedEvent;
     switch (event) {
@@ -949,7 +1076,7 @@ test "handleInput: ignores stun messages once the connection is completed" {
         .username = core.credentials.username,
     }, core.credentials.password, &buffer);
 
-    try core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, msg.bytes), &resp_buffer);
 
     try testing.expectEqual(null, core.pollEvent());
 }
@@ -971,11 +1098,11 @@ test "handleInput: stun request produces a response event" {
         .username = core.credentials.username,
     }, core.credentials.password, &buffer);
 
-    try core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, msg.bytes), &resp_buffer);
 
     const event = core.pollEvent() orelse return error.ExpectedEvent;
     switch (event) {
-        .response => |resp| {
+        .message => |resp| {
             const resp_msg = try stun.Message.parse(resp.data);
             try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
         },
@@ -1001,7 +1128,7 @@ test "handleInput: role conflict switches role and reports no event" {
         .username = core.credentials.username,
     }, core.credentials.password, &buffer);
 
-    try testing.expectError(error.SwitchRole, core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer));
+    try testing.expectError(error.SwitchRole, core.handleInput(.init(&from, &base_addr, msg.bytes), &resp_buffer));
     try testing.expectEqual(null, core.pollEvent());
 }
 
@@ -1030,13 +1157,8 @@ test "handleInput: success response completes the pending request and marks the 
     var resp_buffer: [64]u8 = undefined;
     const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.password, &buffer);
 
-    try core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, msg.bytes), &resp_buffer);
 
-    const event = core.pollEvent() orelse return error.ExpectedEvent;
-    switch (event) {
-        .response => |resp| try testing.expectEqualSlices(u8, msg.bytes, resp.data),
-        else => return error.UnexpectedEvent,
-    }
     try testing.expectEqual(null, core.pollEvent());
 
     try testing.expectEqual(.succeeded, core.pairs.items[0].status);
@@ -1074,23 +1196,205 @@ test "handleInput: success response nominates the pair and transitions to connec
     var resp_buffer: [64]u8 = undefined;
     const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.password, &buffer);
 
-    try core.handleInput(&base_addr, &from, msg.bytes, &resp_buffer);
+    try core.handleInput(.init(&from, &base_addr, msg.bytes), &resp_buffer);
 
-    switch (core.pollEvent() orelse return error.ExpectedResponseEvent) {
-        .response => {},
-        else => return error.UnexpectedEvent,
-    }
-    switch (core.pollEvent() orelse return error.ExpectedNominatedEvent) {
-        .nominated => {},
-        else => return error.UnexpectedEvent,
-    }
-    switch (core.pollEvent() orelse return error.ExpectedConnectionStateEvent) {
-        .connection_state => |state| try testing.expectEqual(.connected, state),
-        else => return error.UnexpectedEvent,
-    }
+    try expectEvent(&core, .nominated);
+    try expectConnectionStateEvent(&core, .connected);
     try testing.expectEqual(null, core.pollEvent());
 
     try testing.expectEqual(.connected, core.connection_state);
     try testing.expect(core.pairs.items[0].nominated);
     try testing.expect(core.nominated_pair != null);
+
+    try testing.expectEqual(@as(i64, keep_alive_interval), core.keep_alive_deadline);
+    try testing.expectEqual(@as(i64, core.disconnected_timeout), core.disconnected_connection_deadline);
+}
+
+test "handleTimeout: new connection starts checking and schedules a connectivity check" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    const failed_timeout: i64 = core.failed_timeout;
+    const deadline = try core.handleTimeout(0);
+
+    try testing.expectEqual(.checking, core.connection_state);
+    try testing.expectEqual(connectivity_check_interval, deadline);
+    try testing.expectEqual(connectivity_check_interval, core.connectivity_check_deadline);
+    try testing.expectEqual(failed_timeout, core.failed_connection_deadline);
+
+    try expectEvent(&core, .connectivity_check);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: checking sends a connectivity_check every interval" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    _ = try core.handleTimeout(0);
+    _ = core.pollEvent();
+
+    const deadline1 = try core.handleTimeout(100);
+    try testing.expectEqual(connectivity_check_interval, deadline1);
+    try testing.expectEqual(null, core.pollEvent());
+
+    const deadline2 = try core.handleTimeout(connectivity_check_interval);
+    try testing.expectEqual(connectivity_check_interval * 2, deadline2);
+    try expectEvent(&core, .connectivity_check);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: checking fails after failed_timeout without connecting" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    _ = try core.handleTimeout(0);
+    _ = core.pollEvent();
+
+    const failed_timeout: i64 = core.failed_timeout;
+    const deadline = try core.handleTimeout(failed_timeout);
+
+    try testing.expectEqual(.failed, core.connection_state);
+    try testing.expectEqual(failed_timeout + connectivity_check_interval, deadline);
+
+    try expectEvent(&core, .connectivity_check);
+    try expectConnectionStateEvent(&core, .failed);
+    try testing.expectEqual(null, core.pollEvent());
+
+    const next = try core.handleTimeout(failed_timeout + 1000);
+    try testing.expectEqual(std.math.maxInt(i64), next);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: connected transitions to completed once keep_alive_deadline elapses and clears the checklist" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .connected;
+    core.connectivity_check_deadline = 100_000;
+    core.disconnected_connection_deadline = 100_000;
+    core.keep_alive_deadline = 1000;
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+    try core.remote_candidates.append(testing.allocator, .initHost(from));
+    try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .succeeded, .priority = 0 });
+    try core.pending_requests.append(testing.allocator, .{ .transaction_id = 0x1, .source = base_addr, .target = from });
+
+    const deadline = try core.handleTimeout(1000);
+
+    try testing.expectEqual(.completed, core.connection_state);
+    try testing.expectEqual(0, core.remote_candidates.items.len);
+    try testing.expectEqual(0, core.pairs.items.len);
+    try testing.expectEqual(0, core.pending_requests.items.len);
+    try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
+    try testing.expectEqual(1000 + keep_alive_interval, deadline);
+
+    try expectConnectionStateEvent(&core, .completed);
+    try expectEvent(&core, .consent_freshness);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: completed sends periodic consent_freshness without changing state" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .completed;
+    core.disconnected_connection_deadline = 100_000;
+    core.keep_alive_deadline = 1000;
+
+    const deadline = try core.handleTimeout(1000);
+
+    try testing.expectEqual(.completed, core.connection_state);
+    try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
+    try testing.expectEqual(1000 + keep_alive_interval, deadline);
+
+    try expectEvent(&core, .consent_freshness);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: disconnected sends periodic consent_freshness without changing state" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .disconnected;
+    core.failed_connection_deadline = 100_000;
+    core.keep_alive_deadline = 1000;
+
+    const deadline = try core.handleTimeout(1000);
+
+    try testing.expectEqual(.disconnected, core.connection_state);
+    try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
+    try testing.expectEqual(1000 + keep_alive_interval, deadline);
+
+    try expectEvent(&core, .consent_freshness);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: connected becomes disconnected after disconnected_timeout of silence and refreshes the failed deadline" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .connected;
+    core.connectivity_check_deadline = 100_000;
+    core.keep_alive_deadline = 100_000;
+    core.disconnected_connection_deadline = 1000;
+
+    const failed_timeout: i64 = core.failed_timeout;
+    const deadline = try core.handleTimeout(1000);
+
+    try testing.expectEqual(.disconnected, core.connection_state);
+    try testing.expectEqual(1000 + failed_timeout, core.failed_connection_deadline);
+    try testing.expectEqual(1000 + failed_timeout, deadline);
+
+    try expectConnectionStateEvent(&core, .disconnected);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: disconnected becomes failed after failed_timeout elapses" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .disconnected;
+    core.keep_alive_deadline = 999_999;
+    core.failed_connection_deadline = 1000;
+
+    const deadline = try core.handleTimeout(1000);
+
+    try testing.expectEqual(.failed, core.connection_state);
+    try testing.expectEqual(999_999, deadline);
+
+    try expectConnectionStateEvent(&core, .failed);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: returns the earliest of the three schedules without firing anything" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .connected;
+    core.connectivity_check_deadline = 5000;
+    core.keep_alive_deadline = 3000;
+    core.disconnected_connection_deadline = 8000;
+
+    const deadline = try core.handleTimeout(1000);
+
+    try testing.expectEqual(.connected, core.connection_state);
+    try testing.expectEqual(3000, deadline);
+    try testing.expectEqual(null, core.pollEvent());
+
+    try testing.expectEqual(5000, core.connectivity_check_deadline);
+    try testing.expectEqual(3000, core.keep_alive_deadline);
+    try testing.expectEqual(8000, core.disconnected_connection_deadline);
+}
+
+test "setRemoteCredentials: replaces and frees the previous value" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    try core.setRemoteCredentials(.{ .username = "first", .password = "first-password-0123456789" });
+    try testing.expectEqualStrings("first", core.remote_credentials.?.username);
+
+    try core.setRemoteCredentials(.{ .username = "second", .password = "second-password-0123456789" });
+    try testing.expectEqualStrings("second", core.remote_credentials.?.username);
+    try testing.expectEqualStrings("second-password-0123456789", core.remote_credentials.?.password);
 }
