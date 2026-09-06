@@ -173,22 +173,26 @@ pub fn init(allocator: std.mem.Allocator, config: Config) Core {
 
 pub fn deinit(core: *Core) void {
     core.close();
-}
-
-pub fn close(core: *Core) void {
     core.pairs.deinit(core.allocator);
     core.pending_requests.deinit(core.allocator);
     core.candidates.deinit(core.allocator);
     core.remote_candidates.deinit(core.allocator);
+    core.events_out.deinit(core.allocator);
+}
+
+pub fn close(core: *Core) void {
+    core.connection_state = .closed;
+
+    core.pairs.clearAndFree(core.allocator);
+    core.pending_requests.clearAndFree(core.allocator);
+    core.candidates.clearAndFree(core.allocator);
+    core.remote_candidates.clearAndFree(core.allocator);
 
     core.credentials.deinit(core.allocator);
     if (core.remote_credentials) |*remote| {
         remote.deinit(core.allocator);
         core.remote_credentials = null;
     }
-
-    core.events_out.deinit(core.allocator);
-    core.connection_state = .closed;
 }
 
 pub fn setRemoteCredentials(core: *Core, credentials: ice.Credentials) !void {
@@ -718,6 +722,18 @@ fn testBuildResponse(tx_id: u96, addr: IpAddress, password: []const u8, buffer: 
     return try stun.Message.parse(w.final());
 }
 
+fn expectEvent(core: *Core, tag: std.meta.Tag(Event)) !void {
+    const event = core.pollEvent() orelse return error.ExpectedEvent;
+    if (std.meta.activeTag(event) != tag) return error.UnexpectedEvent;
+}
+
+fn expectConnectionStateEvent(core: *Core, state: ice.ConnectionState) !void {
+    switch (core.pollEvent() orelse return error.ExpectedEvent) {
+        .connection_state => |s| try testing.expectEqual(state, s),
+        else => return error.UnexpectedEvent,
+    }
+}
+
 test "handleRequest: generate success response" {
     var core = try testNewCore(.controlled);
     defer core.deinit();
@@ -1182,17 +1198,203 @@ test "handleInput: success response nominates the pair and transitions to connec
 
     try core.handleInput(.init(&from, &base_addr, msg.bytes), &resp_buffer);
 
-    switch (core.pollEvent() orelse return error.ExpectedNominatedEvent) {
-        .nominated => {},
-        else => return error.UnexpectedEvent,
-    }
-    switch (core.pollEvent() orelse return error.ExpectedConnectionStateEvent) {
-        .connection_state => |state| try testing.expectEqual(.connected, state),
-        else => return error.UnexpectedEvent,
-    }
+    try expectEvent(&core, .nominated);
+    try expectConnectionStateEvent(&core, .connected);
     try testing.expectEqual(null, core.pollEvent());
 
     try testing.expectEqual(.connected, core.connection_state);
     try testing.expect(core.pairs.items[0].nominated);
     try testing.expect(core.nominated_pair != null);
+
+    try testing.expectEqual(@as(i64, keep_alive_interval), core.keep_alive_deadline);
+    try testing.expectEqual(@as(i64, core.disconnected_timeout), core.disconnected_connection_deadline);
+}
+
+test "handleTimeout: new connection starts checking and schedules a connectivity check" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    const failed_timeout: i64 = core.failed_timeout;
+    const deadline = try core.handleTimeout(0);
+
+    try testing.expectEqual(.checking, core.connection_state);
+    try testing.expectEqual(connectivity_check_interval, deadline);
+    try testing.expectEqual(connectivity_check_interval, core.connectivity_check_deadline);
+    try testing.expectEqual(failed_timeout, core.failed_connection_deadline);
+
+    try expectEvent(&core, .connectivity_check);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: checking sends a connectivity_check every interval" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    _ = try core.handleTimeout(0);
+    _ = core.pollEvent();
+
+    const deadline1 = try core.handleTimeout(100);
+    try testing.expectEqual(connectivity_check_interval, deadline1);
+    try testing.expectEqual(null, core.pollEvent());
+
+    const deadline2 = try core.handleTimeout(connectivity_check_interval);
+    try testing.expectEqual(connectivity_check_interval * 2, deadline2);
+    try expectEvent(&core, .connectivity_check);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: checking fails after failed_timeout without connecting" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    _ = try core.handleTimeout(0);
+    _ = core.pollEvent();
+
+    const failed_timeout: i64 = core.failed_timeout;
+    const deadline = try core.handleTimeout(failed_timeout);
+
+    try testing.expectEqual(.failed, core.connection_state);
+    try testing.expectEqual(failed_timeout + connectivity_check_interval, deadline);
+
+    try expectEvent(&core, .connectivity_check);
+    try expectConnectionStateEvent(&core, .failed);
+    try testing.expectEqual(null, core.pollEvent());
+
+    const next = try core.handleTimeout(failed_timeout + 1000);
+    try testing.expectEqual(std.math.maxInt(i64), next);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: connected transitions to completed once keep_alive_deadline elapses and clears the checklist" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .connected;
+    core.connectivity_check_deadline = 100_000;
+    core.disconnected_connection_deadline = 100_000;
+    core.keep_alive_deadline = 1000;
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+    try core.remote_candidates.append(testing.allocator, .initHost(from));
+    try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .succeeded, .priority = 0 });
+    try core.pending_requests.append(testing.allocator, .{ .transaction_id = 0x1, .source = base_addr, .target = from });
+
+    const deadline = try core.handleTimeout(1000);
+
+    try testing.expectEqual(.completed, core.connection_state);
+    try testing.expectEqual(0, core.remote_candidates.items.len);
+    try testing.expectEqual(0, core.pairs.items.len);
+    try testing.expectEqual(0, core.pending_requests.items.len);
+    try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
+    try testing.expectEqual(1000 + keep_alive_interval, deadline);
+
+    try expectConnectionStateEvent(&core, .completed);
+    try expectEvent(&core, .consent_freshness);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: completed sends periodic consent_freshness without changing state" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .completed;
+    core.disconnected_connection_deadline = 100_000;
+    core.keep_alive_deadline = 1000;
+
+    const deadline = try core.handleTimeout(1000);
+
+    try testing.expectEqual(.completed, core.connection_state);
+    try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
+    try testing.expectEqual(1000 + keep_alive_interval, deadline);
+
+    try expectEvent(&core, .consent_freshness);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: disconnected sends periodic consent_freshness without changing state" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .disconnected;
+    core.failed_connection_deadline = 100_000;
+    core.keep_alive_deadline = 1000;
+
+    const deadline = try core.handleTimeout(1000);
+
+    try testing.expectEqual(.disconnected, core.connection_state);
+    try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
+    try testing.expectEqual(1000 + keep_alive_interval, deadline);
+
+    try expectEvent(&core, .consent_freshness);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: connected becomes disconnected after disconnected_timeout of silence and refreshes the failed deadline" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .connected;
+    core.connectivity_check_deadline = 100_000;
+    core.keep_alive_deadline = 100_000;
+    core.disconnected_connection_deadline = 1000;
+
+    const failed_timeout: i64 = core.failed_timeout;
+    const deadline = try core.handleTimeout(1000);
+
+    try testing.expectEqual(.disconnected, core.connection_state);
+    try testing.expectEqual(1000 + failed_timeout, core.failed_connection_deadline);
+    try testing.expectEqual(1000 + failed_timeout, deadline);
+
+    try expectConnectionStateEvent(&core, .disconnected);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: disconnected becomes failed after failed_timeout elapses" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .disconnected;
+    core.keep_alive_deadline = 999_999;
+    core.failed_connection_deadline = 1000;
+
+    const deadline = try core.handleTimeout(1000);
+
+    try testing.expectEqual(.failed, core.connection_state);
+    try testing.expectEqual(999_999, deadline);
+
+    try expectConnectionStateEvent(&core, .failed);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: returns the earliest of the three schedules without firing anything" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .connected;
+    core.connectivity_check_deadline = 5000;
+    core.keep_alive_deadline = 3000;
+    core.disconnected_connection_deadline = 8000;
+
+    const deadline = try core.handleTimeout(1000);
+
+    try testing.expectEqual(.connected, core.connection_state);
+    try testing.expectEqual(3000, deadline);
+    try testing.expectEqual(null, core.pollEvent());
+
+    try testing.expectEqual(5000, core.connectivity_check_deadline);
+    try testing.expectEqual(3000, core.keep_alive_deadline);
+    try testing.expectEqual(8000, core.disconnected_connection_deadline);
+}
+
+test "setRemoteCredentials: replaces and frees the previous value" {
+    var core = try testNewCore(.controlled);
+    defer core.deinit();
+
+    try core.setRemoteCredentials(.{ .username = "first", .password = "first-password-0123456789" });
+    try testing.expectEqualStrings("first", core.remote_credentials.?.username);
+
+    try core.setRemoteCredentials(.{ .username = "second", .password = "second-password-0123456789" });
+    try testing.expectEqualStrings("second", core.remote_credentials.?.username);
+    try testing.expectEqualStrings("second-password-0123456789", core.remote_credentials.?.password);
 }

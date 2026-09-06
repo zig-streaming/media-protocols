@@ -330,6 +330,8 @@ pub const Credentials = struct {
     pub fn deinit(credens: *Credentials, allocator: std.mem.Allocator) void {
         allocator.free(credens.username);
         allocator.free(credens.password);
+        credens.username = &.{};
+        credens.password = &.{};
     }
 
     pub fn generate(io: std.Io, allocator: std.mem.Allocator) !Credentials {
