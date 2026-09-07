@@ -1,3 +1,4 @@
+pub const Client = @import("client.zig");
 pub const TurnClient = @import("turn_client.zig");
 
 const std = @import("std");
@@ -682,6 +683,7 @@ const testing = std.testing;
 
 test {
     _ = @import("turn_client.zig");
+    _ = @import("client.zig");
 }
 
 test "MessageType: round-trip" {
