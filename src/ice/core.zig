@@ -69,11 +69,17 @@ keep_alive_deadline: i64,
 failed_timeout: u32,
 disconnected_timeout: u32,
 events_out: std.Deque(Event),
+stun_clients: std.AutoHashMapUnmanaged(IpAddress, StunServerEntry) = .empty,
 
 const PendingRequest = struct {
     transaction_id: u96,
     source: IpAddress,
     target: IpAddress,
+};
+
+const StunServerEntry = struct {
+    client: stun.Client,
+    buffer: [64]u8 = undefined,
 };
 
 pub const Send = struct {
@@ -178,6 +184,27 @@ pub fn deinit(core: *Core) void {
     core.candidates.deinit(core.allocator);
     core.remote_candidates.deinit(core.allocator);
     core.events_out.deinit(core.allocator);
+
+    var it = core.stun_clients.valueIterator();
+    while (it.next()) |entry| entry.client.deinit();
+    core.stun_clients.deinit(core.allocator);
+}
+
+pub fn addIceServer(core: *Core, local_addr: IpAddress, remote_addr: IpAddress) !void {
+    try core.stun_clients.put(core.allocator, local_addr, .{ .client = .init(core.allocator, .{ .local_addr = local_addr, .remote_addr = remote_addr }) });
+}
+
+pub fn writeStunBindingRequest(core: *Core, tx_id: u96, now: i64) !void {
+    var it = core.stun_clients.valueIterator();
+    while (it.next()) |entry| {
+        const req = try Messages.builUnauthenticatedBindingRequest(&entry.buffer, tx_id);
+        try entry.client.handleWrite(tx_id, req, now);
+
+        while (entry.client.pollEvent()) |event| switch (event) {
+            .out_message => |m| try core.events_out.pushBack(core.allocator, .{ .message = .init(m.from, m.to, m.data) }),
+            else => {},
+        };
+    }
 }
 
 pub fn close(core: *Core) void {
@@ -292,12 +319,45 @@ pub fn handleTimeout(core: *Core, now: i64) std.mem.Allocator.Error!i64 {
     const ck_deadline = try core.nextConnectivityCheckInterval(now);
     const ka_deadline = try core.nextKeepAliveInterval(now);
     const ct_deadline = try core.nextConnectionTimeout(now);
-    return @min(@min(ck_deadline, ka_deadline), ct_deadline);
+    var deadline = @min(@min(ck_deadline, ka_deadline), ct_deadline);
+
+    var it = core.stun_clients.iterator();
+    while (it.next()) |kv| {
+        const entry = kv.value_ptr;
+        deadline = @min(deadline, try entry.client.handleTimeout(now));
+
+        while (entry.client.pollEvent()) |event| switch (event) {
+            .out_message => |m| try core.events_out.pushBack(core.allocator, .{ .message = .init(m.from, m.to, m.data) }),
+            .timeout => {
+                entry.client.deinit();
+                _ = core.stun_clients.remove(kv.key_ptr.*);
+                break;
+            },
+            else => {},
+        };
+    }
+
+    return deadline;
 }
 
 pub fn handleInput(core: *Core, message: Message, buffer: []u8) !void {
     if (!stun.isMessage(message.data)) {
         try core.handleAppData(message.from, message.data);
+        return;
+    }
+
+    if (core.stun_clients.getPtr(message.to.*)) |entry| {
+        entry.client.handleRead(message.data) catch {};
+        while (entry.client.pollEvent()) |event| switch (event) {
+            .in_message => |msg| if (Messages.getMappedAddress(message.data, msg.header.transaction_id)) |addr| {
+                if (try core.addServerReflexiveCandidate(message.to.*, addr)) |_| {
+                    entry.client.deinit();
+                    _ = core.stun_clients.remove(message.to.*);
+                    break;
+                }
+            } else |_| {},
+            else => {},
+        };
         return;
     }
 
