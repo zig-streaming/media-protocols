@@ -74,59 +74,42 @@ pub const Config = struct {
     password: []const u8,
 };
 
-const AuthInfo = struct {
-    buffer: []u8,
-    nonce_len: u32,
-    realm_len: u32,
-    key_len: u32,
+fn AuthInfo(comptime size: u16) type {
+    return struct {
+        buffer: [size]u8,
+        nonce_len: u32,
+        realm_len: u32,
+        key_len: u32,
 
-    const empty = AuthInfo{
-        .buffer = &.{},
-        .nonce_len = 0,
-        .realm_len = 0,
-        .key_len = 0,
-    };
+        const empty = @This(){ .buffer = undefined, .nonce_len = 0, .realm_len = 0, .key_len = 0 };
 
-    fn init(
-        self: *AuthInfo,
-        allocator: std.mem.Allocator,
-        nonce: []const u8,
-        realm: []const u8,
-        username: []const u8,
-        password: []const u8,
-    ) std.mem.Allocator.Error!void {
-        const new_len = nonce.len + realm.len + 16; // 16 bytes for MD5 digest
-        if (self.buffer.len < new_len) {
-            self.buffer = try allocator.realloc(self.buffer, new_len);
+        fn init(self: *@This(), nonce: []const u8, realm: []const u8, username: []const u8, password: []const u8) std.mem.Allocator.Error!void {
+            const new_len = nonce.len + realm.len + 16; // 16 bytes for MD5 digest
+            if (size < new_len) return error.OutOfMemory;
+
+            @memcpy(self.buffer[0..nonce.len], nonce);
+            @memcpy(self.buffer[nonce.len..][0..realm.len], realm);
+            const digest = self.buffer[nonce.len + realm.len ..][0..16];
+            digest.* = stun.longTermCredentialsKey(std.crypto.hash.Md5, username, realm, password);
+
+            self.nonce_len = @intCast(nonce.len);
+            self.realm_len = @intCast(realm.len);
+            self.key_len = 16;
         }
 
-        @memcpy(self.buffer[0..nonce.len], nonce);
-        @memcpy(self.buffer[nonce.len..][0..realm.len], realm);
-        const digest = self.buffer[nonce.len + realm.len ..][0..16];
-        digest.* = stun.longTermCredentialsKey(std.crypto.hash.Md5, username, realm, password);
+        fn getNonce(self: *@This()) []const u8 {
+            return self.buffer[0..self.nonce_len];
+        }
 
-        self.nonce_len = @intCast(nonce.len);
-        self.realm_len = @intCast(realm.len);
-        self.key_len = 16;
-    }
+        fn getRealm(self: *@This()) []const u8 {
+            return self.buffer[self.nonce_len..][0..self.realm_len];
+        }
 
-    fn deinit(self: *AuthInfo, allocator: std.mem.Allocator) void {
-        allocator.free(self.buffer);
-        self.* = .empty;
-    }
-
-    fn getNonce(self: *AuthInfo) []const u8 {
-        return self.buffer[0..self.nonce_len];
-    }
-
-    fn getRealm(self: *AuthInfo) []const u8 {
-        return self.buffer[self.nonce_len..][0..self.realm_len];
-    }
-
-    fn getKey(self: *AuthInfo) []const u8 {
-        return self.buffer[self.nonce_len + self.realm_len ..][0..self.key_len];
-    }
-};
+        fn getKey(self: *@This()) []const u8 {
+            return self.buffer[self.nonce_len + self.realm_len ..][0..self.key_len];
+        }
+    };
+}
 
 const Transaction = struct {
     id: u96,
@@ -195,7 +178,7 @@ random: *std.Random,
 username: []const u8,
 password: []const u8,
 
-auth_info: AuthInfo,
+auth_info: AuthInfo(128),
 req_payload: [max_payload_size * max_transactions]u8,
 transactions: [max_transactions]?Transaction,
 events_out: std.Deque(Event),
@@ -227,7 +210,6 @@ pub fn init(allocator: std.mem.Allocator, config: Config) TurnClient {
 }
 
 pub fn deinit(c: *TurnClient) void {
-    c.auth_info.deinit(c.allocator);
     c.events_out.deinit(c.allocator);
     c.transmits.deinit(c.allocator);
 }
@@ -534,7 +516,7 @@ fn applyChallenge(c: *TurnClient, msg: *const stun.Message) !void {
     if (realm == null) return error.MissingRealm;
     if (nonce == null) return error.MissingNonce;
 
-    try c.auth_info.init(c.allocator, nonce.?, realm.?, c.username, c.password);
+    try c.auth_info.init(nonce.?, realm.?, c.username, c.password);
 }
 
 fn buildAllocateRequest(c: *TurnClient, buffer: []u8, now: i64, authenticated: bool) !Transaction {
