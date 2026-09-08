@@ -229,7 +229,7 @@ pub fn handleTimeout(c: *TurnClient, now: i64) Error!void {
             try c.transmits.pushBack(c.allocator, .{
                 .from = &c.local_addr,
                 .to = &c.remote_addr,
-                .data = tr.buffer[0..tr.payload_len],
+                .data = c.getBuffer(idx, tr.payload_len),
             });
         }
     }
@@ -507,3 +507,94 @@ fn getBuffer(c: *TurnClient, index: usize, payload_len: u32) []u8 {
     return c.req_payload[start .. start + payload_len];
 }
 
+fn testClient(random: *std.Random) TurnClient {
+    return TurnClient.init(std.testing.allocator, .{
+        .local_addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 12345 } },
+        .remote_addr = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 3478 } },
+        .random = random,
+        .username = "user",
+        .password = "pass",
+    });
+}
+
+test "createAllocation: queues an unauthenticated allocate request" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var random = r.random();
+
+    var c = testClient(&random);
+    defer c.deinit();
+
+    try c.createAllocation(0);
+
+    const out = c.pollOutput() orelse return error.ExpectedOutput;
+    try std.testing.expect(out.from.eql(&c.local_addr));
+    try std.testing.expect(out.to.eql(&c.remote_addr));
+    try std.testing.expectEqual(null, c.pollOutput());
+
+    const msg = try stun.Message.parse(out.data);
+    try std.testing.expectEqual(.request, msg.header.message_type.class());
+    try std.testing.expectEqual(.allocate, msg.header.message_type.method());
+
+    var it = msg.iterateAttributes(&.{});
+    var attribute = try it.next() orelse return error.ExpectedAttribute;
+    try std.testing.expectEqual(.udp, attribute.requested_transport);
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try std.testing.expectEqual(.ip4, attribute.requested_address_family);
+
+    try std.testing.expectEqual(null, try it.next());
+}
+
+test "createAllocation: registers a transaction with a retransmit deadline" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var random = r.random();
+
+    var c = testClient(&random);
+    defer c.deinit();
+
+    try c.createAllocation(1000);
+
+    var found: ?Transaction = null;
+    for (c.transactions) |tr| if (tr != null) {
+        found = tr;
+    };
+
+    const tr = found orelse return error.ExpectedTransaction;
+    try std.testing.expectEqual(.allocate, tr.method);
+    try std.testing.expectEqual(false, tr.authenticated);
+    try std.testing.expectEqual(0, tr.attempt);
+    try std.testing.expectEqual(1000 + base_rto, tr.deadline);
+    try std.testing.expectEqual(1000 + base_rto, c.pollTimeout());
+}
+
+test "createAllocation: fails when an allocation already exists" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var random = r.random();
+
+    var c = testClient(&random);
+    defer c.deinit();
+
+    c.next_allocation_refresh_deadline = 5000;
+    try std.testing.expectError(error.AllocationAlreadyExists, c.createAllocation(0));
+    try std.testing.expectEqual(null, c.pollOutput());
+}
+
+test "createAllocation: fails when no transaction slot is free" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var random = r.random();
+
+    var c = testClient(&random);
+    defer c.deinit();
+
+    for (&c.transactions) |*slot| slot.* = Transaction{
+        .id = 0,
+        .method = .allocate,
+        .authenticated = false,
+        .attempt = 0,
+        .payload_len = 0,
+        .deadline = 0,
+    };
+
+    try std.testing.expectError(error.TooManyTransactions, c.createAllocation(0));
+    try std.testing.expectEqual(null, c.pollOutput());
+}
