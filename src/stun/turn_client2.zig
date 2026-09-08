@@ -6,9 +6,12 @@ const IpAddress = std.Io.net.IpAddress;
 
 const max_payload_size = 384;
 const max_transactions = 8;
+const max_permissions: u16 = 16;
 
 const max_attempts = 7;
 const base_rto = 200; // milliseconds
+
+const permission_refresh_interval = 4 * std.time.ms_per_min;
 
 pub const Error = error{
     AllocationAlreadyExists,
@@ -40,6 +43,7 @@ pub const StunError = error{
     MissingMappedAddress,
     MissingLifetime,
     Timeout,
+    TooManyPermissions,
 };
 
 pub const AllocationResult = struct {
@@ -144,6 +148,46 @@ const Transaction = struct {
     }
 };
 
+const Permissions = struct {
+    addresses: [max_permissions]IpAddress,
+    current_index: u16,
+
+    const init = Permissions{ .addresses = undefined, .current_index = 0 };
+
+    fn add(self: *Permissions, address: IpAddress) error{Overflow}!bool {
+        if (self.contains(address) != null) return false;
+        if (self.current_index >= max_permissions) return error.Overflow;
+        self.addresses[self.current_index] = address;
+        self.current_index += 1;
+        return true;
+    }
+
+    fn delete(self: *Permissions, address: IpAddress) void {
+        if (self.contains(address)) |idx| {
+            self.addresses[idx] = self.addresses[self.current_index - 1];
+            self.current_index -= 1;
+        }
+    }
+
+    fn contains(self: *Permissions, address: IpAddress) ?u16 {
+        for (self.addresses[0..self.current_index], 0..) |*addr, idx| if (sameIp(addr, &address)) return @intCast(idx);
+        return null;
+    }
+
+    fn slice(self: *Permissions) []const IpAddress {
+        return self.addresses[0..self.current_index];
+    }
+
+    fn sameIp(a: *const IpAddress, b: *const IpAddress) bool {
+        if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
+
+        return switch (a.*) {
+            .ip4 => std.mem.eql(u8, &a.ip4.bytes, &b.ip4.bytes),
+            .ip6 => std.mem.eql(u8, &a.ip6.bytes, &b.ip6.bytes),
+        };
+    }
+};
+
 allocator: std.mem.Allocator,
 local_addr: IpAddress,
 remote_addr: IpAddress,
@@ -156,9 +200,11 @@ req_payload: [max_payload_size * max_transactions]u8,
 transactions: [max_transactions]?Transaction,
 events_out: std.Deque(Event),
 transmits: std.Deque(stun.TransportMessage),
+permissions: Permissions,
 
 allocation_lifetime: u32,
-next_allocation_refresh_deadline: i64,
+allocation_refresh_deadline: i64,
+permission_refresh_deadline: i64,
 
 pub fn init(allocator: std.mem.Allocator, config: Config) TurnClient {
     return .{
@@ -173,8 +219,10 @@ pub fn init(allocator: std.mem.Allocator, config: Config) TurnClient {
         .transactions = @splat(null),
         .events_out = .empty,
         .transmits = .empty,
-        .next_allocation_refresh_deadline = 0,
+        .permissions = .init,
         .allocation_lifetime = 0,
+        .allocation_refresh_deadline = 0,
+        .permission_refresh_deadline = 0,
     };
 }
 
@@ -185,7 +233,7 @@ pub fn deinit(c: *TurnClient) void {
 }
 
 pub fn createAllocation(c: *TurnClient, now: i64) Error!void {
-    if (c.next_allocation_refresh_deadline != 0) return error.AllocationAlreadyExists;
+    if (c.allocation_refresh_deadline != 0) return error.AllocationAlreadyExists;
 
     const idx = try c.nextTransactionSlot();
     const tr = try c.buildAllocateRequest(c.getBuffer(idx, max_payload_size), now, false);
@@ -201,7 +249,7 @@ pub fn createAllocation(c: *TurnClient, now: i64) Error!void {
 }
 
 pub fn deleteAllocation(c: *TurnClient, buffer: []u8) !void {
-    if (c.next_allocation_refresh_deadline == 0) return;
+    if (c.allocation_refresh_deadline == 0) return;
 
     const id = c.random.int(u96);
     var w = stun.Writer.init(buffer, .{ .password = c.auth_info.getKey() });
@@ -216,7 +264,7 @@ pub fn deleteAllocation(c: *TurnClient, buffer: []u8) !void {
     });
 
     const msg = w.final();
-    c.next_allocation_refresh_deadline = 0;
+    c.allocation_refresh_deadline = 0;
     c.auth_info.deinit(c.allocator);
 
     try c.transmits.pushBack(c.allocator, .{
@@ -227,13 +275,19 @@ pub fn deleteAllocation(c: *TurnClient, buffer: []u8) !void {
 }
 
 pub fn createPermission(c: *TurnClient, address: IpAddress, now: i64) !void {
-    try c.newCreatePermissionRequest(address, now);
+    if (c.permissions.contains(address) != null) return;
+    try c.newCreatePermissionRequest(&.{address}, now);
 }
 
 pub fn handleTimeout(c: *TurnClient, now: i64) Error!void {
-    if (c.next_allocation_refresh_deadline != 0 and now >= c.next_allocation_refresh_deadline) {
-        c.next_allocation_refresh_deadline = now + (c.allocation_lifetime / 2) * std.time.ms_per_s;
+    if (c.allocation_refresh_deadline != 0 and now >= c.allocation_refresh_deadline) {
+        c.allocation_refresh_deadline = now + (c.allocation_lifetime / 2) * std.time.ms_per_s;
         try c.newRefreshRequest(now);
+    }
+
+    if (c.permission_refresh_deadline != 0 and now >= c.permission_refresh_deadline) {
+        c.permission_refresh_deadline = now + permission_refresh_interval;
+        try c.newCreatePermissionRequest(c.permissions.slice(), now);
     }
 
     var idx: usize = 0;
@@ -271,13 +325,47 @@ pub fn handleRead(c: *TurnClient, buffer: []const u8, now: i64) !void {
     }
 }
 
+/// Get the header size of a TURN message for user data.
+///
+/// Each message to a turn server needs to be prefixed by channel number or
+/// encapsulated in send indication.
+pub fn getDataFrameSize(c: *TurnClient, peer: *const IpAddress, payload_len: usize) struct { u32, usize } {
+    _ = c;
+    // When channel number is used for this peer, return 4 bytes.
+    const prefix: u32 = switch (peer.*) {
+        .ip4 => 36,
+        .ip6 => 48,
+    };
+
+    const padding = (4 - (payload_len % 4)) % 4;
+    return .{ prefix, prefix + payload_len + padding };
+}
+
+pub fn writeDataHeader(c: *TurnClient, peer: *const IpAddress, buffer: []u8, payload_len: usize) void {
+    const header_size, const size = c.getDataFrameSize(peer, payload_len);
+    std.debug.assert(buffer.len >= header_size);
+
+    var w = stun.Writer.init(buffer, .{});
+    w.writeHeader(.{
+        .message_length = @intCast(size - 20),
+        .message_type = .fromClassAndMethod(.indication, .send),
+        .transaction_id = 0,
+    }) catch {};
+    w.writeAttribute(.{ .xor_peer_address = peer.* }) catch {};
+
+    const len = w.writer.buffered().len;
+    std.mem.writeInt(u16, buffer[len..][0..2], @intFromEnum(stun.AttributeType.data), .big);
+    std.mem.writeInt(u16, buffer[len + 2 ..][0..2], @intCast(payload_len), .big);
+}
+
 pub fn pollTimeout(c: *TurnClient) ?i64 {
     var next_deadline: i64 = std.math.maxInt(i64);
     for (c.transactions) |tr| if (tr != null) {
         next_deadline = @min(next_deadline, tr.?.deadline);
     };
 
-    if (c.next_allocation_refresh_deadline != 0) next_deadline = @min(next_deadline, c.next_allocation_refresh_deadline);
+    if (c.allocation_refresh_deadline != 0) next_deadline = @min(next_deadline, c.allocation_refresh_deadline);
+    if (c.permission_refresh_deadline != 0) next_deadline = @min(next_deadline, c.permission_refresh_deadline);
     return if (next_deadline == std.math.maxInt(i64)) null else next_deadline;
 }
 
@@ -323,7 +411,7 @@ fn handleAllocateResponse(c: *TurnClient, tr: *const Transaction, msg: *const st
             try c.events_out.pushBack(c.allocator, result);
             if (result == .allocated) {
                 c.allocation_lifetime = result.allocated.lifetime;
-                c.next_allocation_refresh_deadline = now + (result.allocated.lifetime / 2) * std.time.ms_per_s;
+                c.allocation_refresh_deadline = now + (result.allocated.lifetime / 2) * std.time.ms_per_s;
             }
         },
         else => {},
@@ -354,7 +442,7 @@ fn handleRefreshResponse(c: *TurnClient, tr: *const Transaction, msg: *const stu
                 },
             };
             c.allocation_lifetime = lifetime;
-            c.next_allocation_refresh_deadline = now + (c.allocation_lifetime / 2) * std.time.ms_per_s;
+            c.allocation_refresh_deadline = now + (c.allocation_lifetime / 2) * std.time.ms_per_s;
 
             try c.events_out.pushBack(c.allocator, .{ .allocation_refreshed = lifetime });
         },
@@ -375,11 +463,23 @@ fn handleCreatePermissionResponse(c: *TurnClient, idx: usize, tr: *const Transac
                 },
             };
             const address = c.getXorPeerAddress(idx, tr.payload_len);
-            try c.newCreatePermissionRequest(address, now);
+            try c.newCreatePermissionRequest(&.{address}, now);
         },
         .success_response => {
             const address = c.getXorPeerAddress(idx, tr.payload_len);
-            try c.events_out.pushBack(c.allocator, .{ .permission_created = address });
+            const added = c.permissions.add(address) catch {
+                try c.events_out.pushBack(c.allocator, .{ .permission_failed = .{
+                    .address = address,
+                    .err = StunError.TooManyPermissions,
+                } });
+                return;
+            };
+
+            // Do not store event for permissions that were already present or refreshed.
+            if (added) {
+                try c.events_out.pushBack(c.allocator, .{ .permission_created = address });
+                if (c.permission_refresh_deadline == 0) c.permission_refresh_deadline = now + permission_refresh_interval;
+            }
         },
         else => {},
     }
@@ -399,10 +499,10 @@ fn newRefreshRequest(c: *TurnClient, now: i64) !void {
     });
 }
 
-fn newCreatePermissionRequest(c: *TurnClient, address: IpAddress, now: i64) !void {
+fn newCreatePermissionRequest(c: *TurnClient, addresses: []const IpAddress, now: i64) !void {
     const idx = try c.nextTransactionSlot();
     const buffer = c.getBuffer(idx, max_payload_size);
-    const tr = try c.buildCreatePermissionRequest(address, buffer, now);
+    const tr = try c.buildCreatePermissionRequest(addresses, buffer, now);
 
     c.transactions[idx] = tr;
     try c.transmits.pushBack(c.allocator, .{
@@ -493,13 +593,13 @@ fn buildRefreshRequest(c: *TurnClient, buffer: []u8, now: i64) !Transaction {
     return tr;
 }
 
-fn buildCreatePermissionRequest(c: *TurnClient, address: IpAddress, buffer: []u8, now: i64) !Transaction {
+fn buildCreatePermissionRequest(c: *TurnClient, addresses: []const IpAddress, buffer: []u8, now: i64) !Transaction {
     var tr = Transaction.init(c.random.int(u96), .create_permission, now + base_rto);
 
     var w = stun.Writer.init(buffer, .{ .password = c.auth_info.getKey() });
     try writeHeader(&w, .request, .create_permission, tr.id);
+    for (addresses) |addr| try w.writeAttribute(.{ .xor_peer_address = addr });
     try w.writeAttributes(&.{
-        .{ .xor_peer_address = address },
         .{ .username = c.username },
         .{ .realm = c.auth_info.getRealm() },
         .{ .nonce = c.auth_info.getNonce() },
@@ -660,7 +760,7 @@ test "createAllocation: fails when an allocation already exists" {
     var c = testClient(&random);
     defer c.deinit();
 
-    c.next_allocation_refresh_deadline = 5000;
+    c.allocation_refresh_deadline = 5000;
     try std.testing.expectError(error.AllocationAlreadyExists, c.createAllocation(0));
     try std.testing.expectEqual(null, c.pollOutput());
 }
