@@ -48,11 +48,18 @@ pub const AllocationResult = struct {
     lifetime: u32,
 };
 
+pub const PermissionFailure = struct {
+    address: IpAddress,
+    err: StunError,
+};
+
 pub const Event = union(enum) {
     allocated: AllocationResult,
     allocation_failed: StunError,
     allocation_refreshed: u32,
     allocation_refresh_failed: StunError,
+    permission_failed: PermissionFailure,
+    permission_created: IpAddress,
 };
 
 pub const Config = struct {
@@ -124,6 +131,17 @@ const Transaction = struct {
     attempt: u8,
     payload_len: u32,
     deadline: i64,
+
+    fn init(id: u96, method: stun.Method, deadline: i64) Transaction {
+        return Transaction{
+            .id = id,
+            .method = method,
+            .authenticated = true,
+            .attempt = 0,
+            .payload_len = 0,
+            .deadline = deadline,
+        };
+    }
 };
 
 allocator: std.mem.Allocator,
@@ -208,6 +226,10 @@ pub fn deleteAllocation(c: *TurnClient, buffer: []u8) !void {
     });
 }
 
+pub fn createPermission(c: *TurnClient, address: IpAddress, now: i64) !void {
+    try c.newCreatePermissionRequest(address, now);
+}
+
 pub fn handleTimeout(c: *TurnClient, now: i64) Error!void {
     if (c.next_allocation_refresh_deadline != 0 and now >= c.next_allocation_refresh_deadline) {
         c.next_allocation_refresh_deadline = now + (c.allocation_lifetime / 2) * std.time.ms_per_s;
@@ -244,6 +266,7 @@ pub fn handleRead(c: *TurnClient, buffer: []const u8, now: i64) !void {
     switch (tr.method) {
         .allocate => try c.handleAllocateResponse(&tr, &msg, now),
         .refresh => try c.handleRefreshResponse(&tr, &msg, now),
+        .create_permission => try c.handleCreatePermissionResponse(idx, &tr, &msg, now),
         else => {},
     }
 }
@@ -339,6 +362,29 @@ fn handleRefreshResponse(c: *TurnClient, tr: *const Transaction, msg: *const stu
     }
 }
 
+fn handleCreatePermissionResponse(c: *TurnClient, idx: usize, tr: *const Transaction, msg: *const stun.Message, now: i64) !void {
+    switch (msg.header.message_type.class()) {
+        .error_response => {
+            c.applyChallenge(msg) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Discard => return,
+                else => |e| {
+                    const address = c.getXorPeerAddress(idx, tr.payload_len);
+                    try c.events_out.pushBack(c.allocator, .{ .permission_failed = .{ .address = address, .err = e } });
+                    return;
+                },
+            };
+            const address = c.getXorPeerAddress(idx, tr.payload_len);
+            try c.newCreatePermissionRequest(address, now);
+        },
+        .success_response => {
+            const address = c.getXorPeerAddress(idx, tr.payload_len);
+            try c.events_out.pushBack(c.allocator, .{ .permission_created = address });
+        },
+        else => {},
+    }
+}
+
 fn newRefreshRequest(c: *TurnClient, now: i64) !void {
     const idx = try c.nextTransactionSlot();
     const buffer = c.getBuffer(idx, max_payload_size);
@@ -347,6 +393,19 @@ fn newRefreshRequest(c: *TurnClient, now: i64) !void {
 
     c.transactions[idx] = tr;
     c.transmits.pushBackAssumeCapacity(.{
+        .from = &c.local_addr,
+        .to = &c.remote_addr,
+        .data = c.getBuffer(idx, tr.payload_len),
+    });
+}
+
+fn newCreatePermissionRequest(c: *TurnClient, address: IpAddress, now: i64) !void {
+    const idx = try c.nextTransactionSlot();
+    const buffer = c.getBuffer(idx, max_payload_size);
+    const tr = try c.buildCreatePermissionRequest(address, buffer, now);
+
+    c.transactions[idx] = tr;
+    try c.transmits.pushBack(c.allocator, .{
         .from = &c.local_addr,
         .to = &c.remote_addr,
         .data = c.getBuffer(idx, tr.payload_len),
@@ -434,6 +493,24 @@ fn buildRefreshRequest(c: *TurnClient, buffer: []u8, now: i64) !Transaction {
     return tr;
 }
 
+fn buildCreatePermissionRequest(c: *TurnClient, address: IpAddress, buffer: []u8, now: i64) !Transaction {
+    var tr = Transaction.init(c.random.int(u96), .create_permission, now + base_rto);
+
+    var w = stun.Writer.init(buffer, .{ .password = c.auth_info.getKey() });
+    try writeHeader(&w, .request, .create_permission, tr.id);
+    try w.writeAttributes(&.{
+        .{ .xor_peer_address = address },
+        .{ .username = c.username },
+        .{ .realm = c.auth_info.getRealm() },
+        .{ .nonce = c.auth_info.getNonce() },
+        .{ .message_integrity = &.{} },
+        .fingerprint,
+    });
+
+    tr.payload_len = @intCast(w.final().len);
+    return tr;
+}
+
 fn parseAllocation(client: *TurnClient, msg: *const stun.Message) !Event {
     var relayed_address: ?IpAddress = null;
     var mapped_address: ?IpAddress = null;
@@ -505,6 +582,15 @@ fn findTransaction(c: *TurnClient, tx_id: u96) ?usize {
 fn getBuffer(c: *TurnClient, index: usize, payload_len: u32) []u8 {
     const start = index * max_payload_size;
     return c.req_payload[start .. start + payload_len];
+}
+
+fn getXorPeerAddress(c: *TurnClient, idx: usize, payload_len: u32) IpAddress {
+    const request = stun.Message.parse(c.getBuffer(idx, payload_len)) catch unreachable;
+    var it = request.iterateAttributes(&.{});
+    while (it.next() catch unreachable) |attr| {
+        if (attr == .xor_peer_address) return attr.xor_peer_address;
+    }
+    unreachable;
 }
 
 fn testClient(random: *std.Random) TurnClient {
@@ -597,4 +683,98 @@ test "createAllocation: fails when no transaction slot is free" {
 
     try std.testing.expectError(error.TooManyTransactions, c.createAllocation(0));
     try std.testing.expectEqual(null, c.pollOutput());
+}
+
+test "createPermission: queues a create_permission request for the peer address" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var random = r.random();
+
+    var c = testClient(&random);
+    defer c.deinit();
+
+    const peer = try IpAddress.parse("192.0.2.1", 3478);
+    try c.createPermission(peer, 0);
+
+    const out = c.pollOutput() orelse return error.ExpectedOutput;
+    try std.testing.expectEqual(null, c.pollOutput());
+
+    const msg = try stun.Message.parse(out.data);
+    try std.testing.expectEqual(.request, msg.header.message_type.class());
+    try std.testing.expectEqual(.create_permission, msg.header.message_type.method());
+
+    var it = msg.iterateAttributes(&.{});
+    const attribute = try it.next() orelse return error.ExpectedAttribute;
+    try std.testing.expect(attribute.xor_peer_address.eql(&peer));
+}
+
+test "createPermission: success response emits permission_created" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var random = r.random();
+
+    var c = testClient(&random);
+    defer c.deinit();
+
+    const peer = try IpAddress.parse("192.0.2.1", 3478);
+    try c.createPermission(peer, 0);
+
+    const out = c.pollOutput() orelse return error.ExpectedOutput;
+    const request = try stun.Message.parse(out.data);
+
+    var response_buf: [max_payload_size]u8 = undefined;
+    var w = stun.Writer.init(&response_buf, .{});
+    try writeHeader(&w, .success_response, .create_permission, request.header.transaction_id);
+    try c.handleRead(w.final(), 0);
+
+    const event = c.pollEvent() orelse return error.ExpectedEvent;
+    switch (event) {
+        .permission_created => |addr| try std.testing.expect(addr.eql(&peer)),
+        else => return error.UnexpectedEvent,
+    }
+    try std.testing.expectEqual(null, c.pollEvent());
+}
+
+test "createPermission: unauthorized then a hard failure emits permission_failed" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var random = r.random();
+
+    var c = testClient(&random);
+    defer c.deinit();
+
+    const peer = try IpAddress.parse("192.0.2.1", 3478);
+    try c.createPermission(peer, 0);
+
+    var out = c.pollOutput() orelse return error.ExpectedOutput;
+    var request = try stun.Message.parse(out.data);
+
+    var response_buf: [max_payload_size]u8 = undefined;
+    {
+        var w = stun.Writer.init(&response_buf, .{});
+        try writeHeader(&w, .error_response, .create_permission, request.header.transaction_id);
+        try w.writeAttributes(&.{
+            .{ .error_code = .{ .code = .unauthorized, .reason = "Unauthorized" } },
+            .{ .realm = "realm" },
+            .{ .nonce = "nonce" },
+        });
+        try c.handleRead(w.final(), 0);
+    }
+    try std.testing.expectEqual(null, c.pollEvent());
+
+    out = c.pollOutput() orelse return error.ExpectedOutput;
+    request = try stun.Message.parse(out.data);
+
+    {
+        var w = stun.Writer.init(&response_buf, .{});
+        try writeHeader(&w, .error_response, .create_permission, request.header.transaction_id);
+        try w.writeAttribute(.{ .error_code = .{ .code = .forbidden, .reason = "Forbidden" } });
+        try c.handleRead(w.final(), 0);
+    }
+
+    const event = c.pollEvent() orelse return error.ExpectedEvent;
+    switch (event) {
+        .permission_failed => |failure| {
+            try std.testing.expect(failure.address.eql(&peer));
+            try std.testing.expectEqual(error.Forbidden, failure.err);
+        },
+        else => return error.UnexpectedEvent,
+    }
 }
