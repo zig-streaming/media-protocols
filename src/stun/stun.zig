@@ -1,6 +1,6 @@
 pub const Client = @import("client.zig");
 pub const TurnClient = @import("turn_client.zig");
-pub const TurnClient2 = @import("turn_client2.zig");
+pub const TurnClient2 = @import("turn_client2.zig").TurnClient;
 
 const std = @import("std");
 const Io = std.Io;
