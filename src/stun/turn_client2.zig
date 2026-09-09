@@ -1,5 +1,6 @@
 const std = @import("std");
 const stun = @import("stun.zig");
+const BoundedDeque = @import("bounded_deque.zig").BoundedDeque;
 
 const TurnClient = @This();
 const IpAddress = std.Io.net.IpAddress;
@@ -16,7 +17,8 @@ const permission_refresh_interval = 4 * std.time.ms_per_min;
 pub const Error = error{
     AllocationAlreadyExists,
     TooManyTransactions,
-} || std.Io.Writer.Error || std.mem.Allocator.Error;
+    Overflow,
+} || std.Io.Writer.Error;
 
 pub const StunError = error{
     BadRequest,
@@ -171,7 +173,6 @@ const Permissions = struct {
     }
 };
 
-allocator: std.mem.Allocator,
 local_addr: IpAddress,
 remote_addr: IpAddress,
 random: *std.Random,
@@ -181,17 +182,16 @@ password: []const u8,
 auth_info: AuthInfo(128),
 req_payload: [max_payload_size * max_transactions]u8,
 transactions: [max_transactions]?Transaction,
-events_out: std.Deque(Event),
-transmits: std.Deque(stun.TransportMessage),
+events_out: BoundedDeque(Event, max_transactions),
+transmits: BoundedDeque(stun.TransportMessage, max_transactions),
 permissions: Permissions,
 
 allocation_lifetime: u32,
 allocation_refresh_deadline: i64,
 permission_refresh_deadline: i64,
 
-pub fn init(allocator: std.mem.Allocator, config: Config) TurnClient {
+pub fn init(config: Config) TurnClient {
     return .{
-        .allocator = allocator,
         .random = config.random,
         .local_addr = config.local_addr,
         .remote_addr = config.remote_addr,
@@ -209,25 +209,9 @@ pub fn init(allocator: std.mem.Allocator, config: Config) TurnClient {
     };
 }
 
-pub fn deinit(c: *TurnClient) void {
-    c.events_out.deinit(c.allocator);
-    c.transmits.deinit(c.allocator);
-}
-
 pub fn createAllocation(c: *TurnClient, now: i64) Error!void {
     if (c.allocation_refresh_deadline != 0) return error.AllocationAlreadyExists;
-
-    const idx = try c.nextTransactionSlot();
-    const tr = try c.buildAllocateRequest(c.getBuffer(idx, max_payload_size), now, false);
-
-    try c.transmits.ensureUnusedCapacity(c.allocator, 1);
-
-    c.transactions[idx] = tr;
-    c.transmits.pushBackAssumeCapacity(.{
-        .from = &c.local_addr,
-        .to = &c.remote_addr,
-        .data = c.getBuffer(idx, tr.payload_len),
-    });
+    try c.newAllocateRequest(now, false);
 }
 
 pub fn deleteAllocation(c: *TurnClient, buffer: []u8) !void {
@@ -247,9 +231,8 @@ pub fn deleteAllocation(c: *TurnClient, buffer: []u8) !void {
 
     const msg = w.final();
     c.allocation_refresh_deadline = 0;
-    c.auth_info.deinit(c.allocator);
 
-    try c.transmits.pushBack(c.allocator, .{
+    try c.transmits.pushBack(.{
         .from = &c.local_addr,
         .to = &c.remote_addr,
         .data = msg,
@@ -281,10 +264,10 @@ pub fn handleTimeout(c: *TurnClient, now: i64) Error!void {
         tr.attempt += 1;
         if (tr.attempt >= max_attempts) {
             c.transactions[idx] = null;
-            try c.events_out.pushBack(c.allocator, .{ .allocation_failed = StunError.Timeout });
+            try c.events_out.pushBack(.{ .allocation_failed = StunError.Timeout });
         } else {
             tr.deadline = now + @as(i64, tr.attempt + 1) * base_rto;
-            try c.transmits.pushBack(c.allocator, .{
+            try c.transmits.pushBack(.{
                 .from = &c.local_addr,
                 .to = &c.remote_addr,
                 .data = c.getBuffer(idx, tr.payload_len),
@@ -371,26 +354,15 @@ fn handleAllocateResponse(c: *TurnClient, tr: *const Transaction, msg: *const st
     switch (msg.header.message_type.class()) {
         .error_response => {
             if (tr.authenticated) {
-                try c.events_out.pushBack(c.allocator, .{ .allocation_failed = StunError.Unauthorized });
+                try c.events_out.pushBack(.{ .allocation_failed = StunError.Unauthorized });
                 return;
             }
-
             try c.applyChallenge(msg);
-            const idx = try c.nextTransactionSlot();
-            const buffer = c.getBuffer(idx, max_payload_size);
-            const new_tr = try c.buildAllocateRequest(buffer, now, true);
-            try c.transmits.ensureUnusedCapacity(c.allocator, 1);
-
-            c.transactions[idx] = new_tr;
-            c.transmits.pushBackAssumeCapacity(.{
-                .from = &c.local_addr,
-                .to = &c.remote_addr,
-                .data = c.getBuffer(idx, new_tr.payload_len),
-            });
+            try c.newAllocateRequest(now, true);
         },
         .success_response => {
             const result = try c.parseAllocation(msg);
-            try c.events_out.pushBack(c.allocator, result);
+            try c.events_out.pushBack(result);
             if (result == .allocated) {
                 c.allocation_lifetime = result.allocated.lifetime;
                 c.allocation_refresh_deadline = now + (result.allocated.lifetime / 2) * std.time.ms_per_s;
@@ -409,7 +381,7 @@ fn handleRefreshResponse(c: *TurnClient, tr: *const Transaction, msg: *const stu
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Discard => return,
                 else => |e| {
-                    try c.events_out.pushBack(c.allocator, .{ .allocation_refresh_failed = e });
+                    try c.events_out.pushBack(.{ .allocation_refresh_failed = e });
                     return;
                 },
             };
@@ -419,14 +391,14 @@ fn handleRefreshResponse(c: *TurnClient, tr: *const Transaction, msg: *const stu
             const lifetime = c.parseRefresh(msg) catch |err| switch (err) {
                 error.Discard => return,
                 else => |e| {
-                    try c.events_out.pushBack(c.allocator, .{ .allocation_refresh_failed = e });
+                    try c.events_out.pushBack(.{ .allocation_refresh_failed = e });
                     return;
                 },
             };
             c.allocation_lifetime = lifetime;
             c.allocation_refresh_deadline = now + (c.allocation_lifetime / 2) * std.time.ms_per_s;
 
-            try c.events_out.pushBack(c.allocator, .{ .allocation_refreshed = lifetime });
+            try c.events_out.pushBack(.{ .allocation_refreshed = lifetime });
         },
         else => {},
     }
@@ -440,7 +412,7 @@ fn handleCreatePermissionResponse(c: *TurnClient, idx: usize, tr: *const Transac
                 error.Discard => return,
                 else => |e| {
                     const address = c.getXorPeerAddress(idx, tr.payload_len);
-                    try c.events_out.pushBack(c.allocator, .{ .permission_failed = .{ .address = address, .err = e } });
+                    try c.events_out.pushBack(.{ .permission_failed = .{ .address = address, .err = e } });
                     return;
                 },
             };
@@ -450,7 +422,7 @@ fn handleCreatePermissionResponse(c: *TurnClient, idx: usize, tr: *const Transac
         .success_response => {
             const address = c.getXorPeerAddress(idx, tr.payload_len);
             const added = c.permissions.add(address) catch {
-                try c.events_out.pushBack(c.allocator, .{ .permission_failed = .{
+                try c.events_out.pushBack(.{ .permission_failed = .{
                     .address = address,
                     .err = StunError.TooManyPermissions,
                 } });
@@ -459,7 +431,7 @@ fn handleCreatePermissionResponse(c: *TurnClient, idx: usize, tr: *const Transac
 
             // Do not store event for permissions that were already present or refreshed.
             if (added) {
-                try c.events_out.pushBack(c.allocator, .{ .permission_created = address });
+                try c.events_out.pushBack(.{ .permission_created = address });
                 if (c.permission_refresh_deadline == 0) c.permission_refresh_deadline = now + permission_refresh_interval;
             }
         },
@@ -467,14 +439,26 @@ fn handleCreatePermissionResponse(c: *TurnClient, idx: usize, tr: *const Transac
     }
 }
 
+fn newAllocateRequest(c: *TurnClient, now: i64, authenticated: bool) !void {
+    const idx = try c.nextTransactionSlot();
+    const buffer = c.getBuffer(idx, max_payload_size);
+    const new_tr = try c.buildAllocateRequest(buffer, now, authenticated);
+
+    c.transactions[idx] = new_tr;
+    try c.transmits.pushBack(.{
+        .from = &c.local_addr,
+        .to = &c.remote_addr,
+        .data = c.getBuffer(idx, new_tr.payload_len),
+    });
+}
+
 fn newRefreshRequest(c: *TurnClient, now: i64) !void {
     const idx = try c.nextTransactionSlot();
     const buffer = c.getBuffer(idx, max_payload_size);
     const tr = try c.buildRefreshRequest(buffer, now);
-    try c.transmits.ensureUnusedCapacity(c.allocator, 1);
 
     c.transactions[idx] = tr;
-    c.transmits.pushBackAssumeCapacity(.{
+    try c.transmits.pushBack(.{
         .from = &c.local_addr,
         .to = &c.remote_addr,
         .data = c.getBuffer(idx, tr.payload_len),
@@ -487,7 +471,7 @@ fn newCreatePermissionRequest(c: *TurnClient, addresses: []const IpAddress, now:
     const tr = try c.buildCreatePermissionRequest(addresses, buffer, now);
 
     c.transactions[idx] = tr;
-    try c.transmits.pushBack(c.allocator, .{
+    try c.transmits.pushBack(.{
         .from = &c.local_addr,
         .to = &c.remote_addr,
         .data = c.getBuffer(idx, tr.payload_len),
@@ -676,7 +660,7 @@ fn getXorPeerAddress(c: *TurnClient, idx: usize, payload_len: u32) IpAddress {
 }
 
 fn testClient(random: *std.Random) TurnClient {
-    return TurnClient.init(std.testing.allocator, .{
+    return TurnClient.init(.{
         .local_addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 12345 } },
         .remote_addr = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 3478 } },
         .random = random,
@@ -690,7 +674,6 @@ test "createAllocation: queues an unauthenticated allocate request" {
     var random = r.random();
 
     var c = testClient(&random);
-    defer c.deinit();
 
     try c.createAllocation(0);
 
@@ -718,7 +701,6 @@ test "createAllocation: registers a transaction with a retransmit deadline" {
     var random = r.random();
 
     var c = testClient(&random);
-    defer c.deinit();
 
     try c.createAllocation(1000);
 
@@ -740,7 +722,6 @@ test "createAllocation: fails when an allocation already exists" {
     var random = r.random();
 
     var c = testClient(&random);
-    defer c.deinit();
 
     c.allocation_refresh_deadline = 5000;
     try std.testing.expectError(error.AllocationAlreadyExists, c.createAllocation(0));
@@ -752,7 +733,6 @@ test "createAllocation: fails when no transaction slot is free" {
     var random = r.random();
 
     var c = testClient(&random);
-    defer c.deinit();
 
     for (&c.transactions) |*slot| slot.* = Transaction{
         .id = 0,
@@ -767,12 +747,49 @@ test "createAllocation: fails when no transaction slot is free" {
     try std.testing.expectEqual(null, c.pollOutput());
 }
 
+test "deleteAllocation: does nothing without an active allocation" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var random = r.random();
+
+    var c = testClient(&random);
+
+    var buffer: [max_payload_size]u8 = undefined;
+    try c.deleteAllocation(&buffer);
+
+    try std.testing.expectEqual(null, c.pollOutput());
+}
+
+test "deleteAllocation: queues a refresh request with lifetime zero and clears the deadline" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var random = r.random();
+
+    var c = testClient(&random);
+    c.allocation_refresh_deadline = 5000;
+
+    var buffer: [max_payload_size]u8 = undefined;
+    try c.deleteAllocation(&buffer);
+
+    try std.testing.expectEqual(0, c.allocation_refresh_deadline);
+
+    const out = c.pollOutput() orelse return error.ExpectedOutput;
+    try std.testing.expect(out.from.eql(&c.local_addr));
+    try std.testing.expect(out.to.eql(&c.remote_addr));
+    try std.testing.expectEqual(null, c.pollOutput());
+
+    const msg = try stun.Message.parse(out.data);
+    try std.testing.expectEqual(.request, msg.header.message_type.class());
+    try std.testing.expectEqual(.refresh, msg.header.message_type.method());
+
+    var it = msg.iterateAttributes(&.{});
+    const attribute = try it.next() orelse return error.ExpectedAttribute;
+    try std.testing.expectEqual(0, attribute.lifetime);
+}
+
 test "createPermission: queues a create_permission request for the peer address" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
     var random = r.random();
 
     var c = testClient(&random);
-    defer c.deinit();
 
     const peer = try IpAddress.parse("192.0.2.1", 3478);
     try c.createPermission(peer, 0);
@@ -794,7 +811,6 @@ test "createPermission: success response emits permission_created" {
     var random = r.random();
 
     var c = testClient(&random);
-    defer c.deinit();
 
     const peer = try IpAddress.parse("192.0.2.1", 3478);
     try c.createPermission(peer, 0);
@@ -820,7 +836,6 @@ test "createPermission: unauthorized then a hard failure emits permission_failed
     var random = r.random();
 
     var c = testClient(&random);
-    defer c.deinit();
 
     const peer = try IpAddress.parse("192.0.2.1", 3478);
     try c.createPermission(peer, 0);
