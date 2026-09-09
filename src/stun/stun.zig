@@ -1,5 +1,6 @@
 pub const Client = @import("client.zig");
 pub const TurnClient = @import("turn_client.zig");
+pub const TurnClient2 = @import("turn_client2.zig").TurnClient;
 
 const std = @import("std");
 const Io = std.Io;
@@ -8,6 +9,12 @@ pub const magic_cookie: u32 = 0x2112A442;
 pub const header_size = 20;
 
 const fingerprint_xor: u32 = 0x5354554e;
+
+pub const TransportMessage = struct {
+    from: *const Io.net.IpAddress,
+    to: *const Io.net.IpAddress,
+    data: []const u8,
+};
 
 /// Returns `true` if it's stun message.
 pub fn isMessage(msg: []const u8) bool {
@@ -510,12 +517,7 @@ pub const Writer = struct {
     writer: Io.Writer,
     options: WriterOptions,
 
-    pub const Error = error{
-        /// The attribute is not supported by the writer.
-        UnknownAttribute,
-        /// Write failed, the buffer is too small to write the message.
-        WriteFailed,
-    };
+    pub const Error = error{WriteFailed};
 
     pub const WriterOptions = struct {
         password: ?[]const u8 = null,
@@ -526,11 +528,11 @@ pub const Writer = struct {
         return .{ .writer = .fixed(buffer), .options = options };
     }
 
-    pub fn writeHeader(msg_writer: *Writer, header: Header) Io.Writer.Error!void {
+    pub fn writeHeader(msg_writer: *Writer, header: Header) Error!void {
         try msg_writer.writer.writeStruct(header, .big);
     }
 
-    pub fn writeRaw(msg_writer: *Writer, attr_type: AttributeType, content: [][]const u8) Io.Writer.Error!void {
+    pub fn writeRaw(msg_writer: *Writer, attr_type: AttributeType, content: [][]const u8) Error!void {
         var w = &msg_writer.writer;
 
         try w.writeInt(u16, @intFromEnum(attr_type), .big);
@@ -592,7 +594,7 @@ pub const Writer = struct {
                 try out.writeAll(&[_]u8{ 0, 0, icmp.type, icmp.code });
                 try out.writeInt(u32, icmp.error_data, .big);
             },
-            else => return error.UnknownAttribute,
+            else => return,
         }
 
         const padding = switch (@rem(out.end, 4)) {
@@ -683,6 +685,7 @@ const testing = std.testing;
 
 test {
     _ = @import("turn_client.zig");
+    _ = @import("turn_client2.zig");
     _ = @import("client.zig");
 }
 
