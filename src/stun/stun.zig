@@ -1,4 +1,5 @@
-pub const Client = @import("client.zig");
+pub const BoundedDeque = @import("bounded_deque.zig").BoundedDeque;
+pub const Client = @import("client.zig").Client;
 pub const TurnClient = @import("turn_client.zig");
 pub const TurnClient2 = @import("turn_client2.zig").TurnClient;
 
