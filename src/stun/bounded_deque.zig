@@ -46,7 +46,7 @@ test "pushBack: returns error.Overflow when full" {
 
 test "popFront: returns null when empty" {
     var deque: BoundedDeque(u32, 2) = .empty;
-    try std.testing.expectEqual(@as(?u32, null), deque.popFront());
+    try std.testing.expectEqual(null, deque.popFront());
 }
 
 test "pushBack/popFront: wraps around the ring buffer" {
@@ -55,14 +55,14 @@ test "pushBack/popFront: wraps around the ring buffer" {
     try deque.pushBack(2);
     try deque.pushBack(3);
 
-    try std.testing.expectEqual(@as(?u32, 1), deque.popFront());
-    try std.testing.expectEqual(@as(?u32, 2), deque.popFront());
+    try std.testing.expectEqual(1, deque.popFront());
+    try std.testing.expectEqual(2, deque.popFront());
 
     try deque.pushBack(4);
     try deque.pushBack(5);
 
-    try std.testing.expectEqual(@as(?u32, 3), deque.popFront());
-    try std.testing.expectEqual(@as(?u32, 4), deque.popFront());
-    try std.testing.expectEqual(@as(?u32, 5), deque.popFront());
-    try std.testing.expectEqual(@as(?u32, null), deque.popFront());
+    try std.testing.expectEqual(3, deque.popFront());
+    try std.testing.expectEqual(4, deque.popFront());
+    try std.testing.expectEqual(5, deque.popFront());
+    try std.testing.expectEqual(null, deque.popFront());
 }
