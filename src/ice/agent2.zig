@@ -404,17 +404,17 @@ pub fn buildBindingRequest(core: *Agent, tx_id: u96, use_candidate: bool, buffer
     return w.final();
 }
 
-pub fn toggleRole(core: *Agent, tie_breaker: u64) void {
-    switch (core.role) {
-        .controlling => core.role = .controlled,
-        .controlled => core.role = .controlling,
+pub fn toggleRole(agent: *Agent) void {
+    switch (agent.role) {
+        .controlling => agent.role = .controlled,
+        .controlled => agent.role = .controlling,
     }
-    core.tie_breaker = tie_breaker;
+    agent.tie_breaker = agent.random.int(u64);
 
-    for (core.pairs.items) |*pair| {
-        const local = core.getPairLocal(pair);
-        const remote = core.getPairRemote(pair);
-        pair.priority = calculatePairPriority(local.priority, remote.priority, core.role);
+    for (agent.pairs.items) |*pair| {
+        const local = agent.getPairLocal(pair);
+        const remote = agent.getPairRemote(pair);
+        pair.priority = calculatePairPriority(local.priority, remote.priority, agent.role);
     }
 }
 
@@ -447,13 +447,13 @@ fn setConnectionState(agent: *Agent, state: ice.ConnectionState, now: i64) !void
     try agent.events_out.pushBack(agent.allocator, .{ .connection_state = agent.connection_state });
 }
 
-fn handleAppData(core: *Agent, sender: *const IpAddress, data: []const u8) !void {
-    switch (core.connection_state) {
-        .connected, .completed => try core.events_out.pushBack(core.allocator, .{ .data = data }),
+fn handleAppData(agent: *Agent, sender: *const IpAddress, data: []const u8) !void {
+    switch (agent.connection_state) {
+        .connected, .completed => try agent.events_out.pushBack(agent.allocator, .{ .data = data }),
         else => {
-            for (core.pairs.items) |*candidate_pair| {
-                const remote = &core.remote_candidates.items[candidate_pair.remote];
-                if (remote.address.eql(sender)) try core.events_out.pushBack(core.allocator, .{ .data = data });
+            for (agent.pairs.items) |*candidate_pair| {
+                const remote = &agent.remote_candidates.items[candidate_pair.remote];
+                if (remote.address.eql(sender)) try agent.events_out.pushBack(agent.allocator, .{ .data = data });
             } else {
                 Logger.warn("Drop non stun message from unknown remote candidate: {f}", .{sender});
             }
@@ -461,42 +461,46 @@ fn handleAppData(core: *Agent, sender: *const IpAddress, data: []const u8) !void
     }
 }
 
-fn handleRequest(core: *Agent, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress, buffer: []u8) ![]const u8 {
-    const stun_req = Messages.parseAndValidateStunRequest(msg, core.credentials, core.role, core.tie_breaker) catch |err| switch (err) {
-        error.RoleConflict => return try Messages.buildRoleConflictErrorMessage(msg.header.transaction_id, core.credentials.password, buffer),
+fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress, buffer: []u8) ![]const u8 {
+    const stun_req = Messages.parseAndValidateStunRequest(msg, agent.credentials, agent.role, agent.tie_breaker) catch |err| switch (err) {
+        error.RoleConflict => return try Messages.buildRoleConflictErrorMessage(msg.header.transaction_id, agent.credentials.password, buffer),
+        error.SwitchRole => blk: {
+            agent.toggleRole();
+            break :blk try Messages.parseAndValidateStunRequest(msg, agent.credentials, agent.role, agent.tie_breaker);
+        },
         else => |e| return e,
     };
 
-    if (core.findCandidatePair(base_addr, from)) |candidate_pair| {
+    if (agent.findCandidatePair(base_addr, from)) |candidate_pair| {
         switch (candidate_pair.status) {
             .succeeded => candidate_pair.nominated |= stun_req.use_candidate,
             else => candidate_pair.nominate_on_binding |= stun_req.use_candidate,
         }
     } else {
-        const local_idx = core.findLocalCandidate(base_addr, base_addr) orelse return error.NoLocalCandidate;
-        const local_candidate = core.candidates.items[local_idx];
+        const local_idx = agent.findLocalCandidate(base_addr, base_addr) orelse return error.NoLocalCandidate;
+        const local_candidate = agent.candidates.items[local_idx];
 
-        const remote_idx: u32 = core.findRemoteCandidate(from) orelse blk: {
+        const remote_idx: u32 = agent.findRemoteCandidate(from) orelse blk: {
             const candidate = Candidate{
                 .base = from.*,
                 .address = from.*,
                 .candidate_type = .prflx,
                 .priority = stun_req.priority,
             };
-            try core.remote_candidates.append(core.allocator, candidate);
-            break :blk @intCast(core.remote_candidates.items.len - 1);
+            try agent.remote_candidates.append(agent.allocator, candidate);
+            break :blk @intCast(agent.remote_candidates.items.len - 1);
         };
 
-        try core.pairs.append(core.allocator, .{
+        try agent.pairs.append(agent.allocator, .{
             .local = local_idx,
             .remote = remote_idx,
-            .priority = calculatePairPriority(local_candidate.priority, stun_req.priority, core.role),
+            .priority = calculatePairPriority(local_candidate.priority, stun_req.priority, agent.role),
             .status = .in_progress,
             .nominate_on_binding = stun_req.use_candidate,
         });
     }
 
-    return try Messages.buildSuccessResponse(msg, core.credentials.password, from, buffer);
+    return try Messages.buildSuccessResponse(msg, agent.credentials.password, from, buffer);
 }
 
 fn handleSuccessResponse(core: *Agent, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress) !void {
@@ -821,6 +825,7 @@ test "handleRequest: role conflict" {
 
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
+    try core.addLocalAddrs(&.{base_addr});
 
     {
         const msg = try testBuildRequest(.{
@@ -835,6 +840,7 @@ test "handleRequest: role conflict" {
         try testing.expectEqual(.error_response, resp_msg.header.message_type.class());
         try testing.expectEqual(.binding, resp_msg.header.message_type.method());
         try testing.expectEqual(msg.header.transaction_id, resp_msg.header.transaction_id);
+        try testing.expectEqual(.controlled, core.role);
 
         var it = resp_msg.iterateAttributes(core.credentials.password);
         const attr = (try it.next()).?;
@@ -850,7 +856,11 @@ test "handleRequest: role conflict" {
             .username = core.credentials.username,
         }, core.credentials.password, &buffer);
 
-        try testing.expectError(error.SwitchRole, core.handleRequest(&msg, &base_addr, &from, &resp_buffer));
+        const resp = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
+        const resp_msg = try stun.Message.parse(resp);
+
+        try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
+        try testing.expectEqual(.controlling, core.role);
     }
 }
 
@@ -964,17 +974,19 @@ test "toggleRole: flips role, tie breaker and pair priorities" {
 
     try testing.expectEqual(1, core.pairs.items.len);
     const controlling_priority = core.pairs.items[0].priority;
+    const controlling_tie_breaker = core.tie_breaker;
 
-    core.toggleRole(0xDEADBEEF);
+    core.toggleRole();
 
     try testing.expectEqual(.controlled, core.role);
-    try testing.expectEqual(0xDEADBEEF, core.tie_breaker);
+    try testing.expect(core.tie_breaker != controlling_tie_breaker);
     try testing.expect(core.pairs.items[0].priority != controlling_priority);
 
-    core.toggleRole(0x1000000);
+    const controlled_tie_breaker = core.tie_breaker;
+    core.toggleRole();
 
     try testing.expectEqual(.controlling, core.role);
-    try testing.expectEqual(0x1000000, core.tie_breaker);
+    try testing.expect(core.tie_breaker != controlled_tie_breaker);
     try testing.expectEqual(controlling_priority, core.pairs.items[0].priority);
 }
 
@@ -1081,7 +1093,7 @@ test "handleInput: stun request produces a response event" {
     try testing.expectEqual(1, core.pairs.items.len);
 }
 
-test "handleInput: role conflict switches role and reports no event" {
+test "handleInput: role conflict switches role and produces a response" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
 
@@ -1090,6 +1102,7 @@ test "handleInput: role conflict switches role and reports no event" {
 
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
+    try core.addLocalAddrs(&.{base_addr});
 
     const msg = try testBuildRequest(.{
         .ice_controlled = 0,
@@ -1097,7 +1110,16 @@ test "handleInput: role conflict switches role and reports no event" {
         .username = core.credentials.username,
     }, core.credentials.password, &buffer);
 
-    try testing.expectError(error.SwitchRole, core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer));
+    try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
+
+    try testing.expectEqual(.controlling, core.role);
+
+    const resp = core.pollTransmit() orelse return error.ExpectedTransmit;
+    const resp_msg = try stun.Message.parse(resp.data);
+    try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
+
+    try expectEvent(&core, .candidate);
+    try expectEvent(&core, .gathering_state);
     try testing.expectEqual(null, core.pollEvent());
 }
 
