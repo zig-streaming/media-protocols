@@ -1,4 +1,6 @@
 pub const Agent = @import("agent.zig");
+pub const Agent2 = @import("agent2.zig");
+pub const TimerManager = @import("timer_manager.zig");
 
 const std = @import("std");
 const Io = std.Io;
@@ -371,6 +373,7 @@ pub const Credentials = struct {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("agent.zig");
+    _ = @import("agent2.zig");
     _ = @import("core.zig");
     _ = @import("candidate_pair.zig");
     _ = @import("messages.zig");
